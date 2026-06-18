@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDF to Excel Converter</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f0f4f8; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .card { background: #fff; border-radius: 16px; box-shadow: 0 4px 24px rgba(0,0,0,0.08); padding: 40px; max-width: 520px; width: 100%; }
+  h1 { font-size: 1.5rem; color: #1a202c; margin-bottom: 6px; }
+  .subtitle { color: #718096; font-size: 0.9rem; margin-bottom: 28px; }
+  .drop-zone {
+    border: 2px dashed #cbd5e0; border-radius: 12px; padding: 40px 24px;
+    text-align: center; cursor: pointer; transition: all 0.2s;
+    color: #a0aec0; background: #f7fafc;
+  }
+  .drop-zone:hover, .drop-zone.dragover { border-color: #4299e1; background: #ebf8ff; color: #2b6cb0; }
+  .drop-zone .icon { font-size: 2.5rem; margin-bottom: 10px; }
+  .drop-zone p { font-size: 0.95rem; }
+  .drop-zone small { font-size: 0.8rem; color: #a0aec0; margin-top: 6px; display: block; }
+  #file-input { display: none; }
+  .status-box { margin-top: 24px; display: none; }
+  .progress-bar-wrap { background: #e2e8f0; border-radius: 99px; height: 8px; overflow: hidden; margin: 10px 0; }
+  .progress-bar { height: 100%; background: #4299e1; border-radius: 99px; transition: width 0.3s; width: 10%; }
+  .progress-bar.indeterminate { animation: slide 1.5s infinite; width: 40%; }
+  @keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+  .msg { font-size: 0.88rem; color: #4a5568; margin-top: 6px; }
+  .download-btn {
+    display: inline-block; margin-top: 16px; padding: 12px 28px;
+    background: #38a169; color: #fff; border-radius: 8px; text-decoration: none;
+    font-weight: 600; font-size: 0.95rem; transition: background 0.2s;
+  }
+  .download-btn:hover { background: #2f855a; }
+  .error-box { margin-top: 16px; background: #fff5f5; border: 1px solid #fc8181; border-radius: 8px; padding: 14px; color: #c53030; font-size: 0.88rem; display: none; }
+  .reset-btn { margin-top: 20px; background: none; border: none; color: #4299e1; cursor: pointer; font-size: 0.88rem; text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📄 PDF → Excel</h1>
+  <p class="subtitle">Chuyển đổi bảng trong PDF thành file Excel. Hỗ trợ cả PDF text và PDF scan.</p>
+
+  <div class="drop-zone" id="drop-zone">
+    <div class="icon">⬆️</div>
+    <p>Kéo thả file PDF vào đây</p>
+    <p>hoặc <label for="file-input" style="color:#4299e1;cursor:pointer;text-decoration:underline">chọn file</label></p>
+    <small>Tối đa 100MB</small>
+  </div>
+  <input type="file" id="file-input" accept=".pdf,application/pdf">
+
+  <div class="status-box" id="status-box">
+    <div class="progress-bar-wrap"><div class="progress-bar indeterminate" id="progress-bar"></div></div>
+    <div class="msg" id="progress-msg">Đang xử lý...</div>
+    <a class="download-btn" id="download-btn" href="#" style="display:none">⬇️ Tải file Excel</a>
+    <button class="reset-btn" id="reset-btn" style="display:none">Chuyển đổi file khác</button>
+  </div>
+
+  <div class="error-box" id="error-box"></div>
+</div>
+
+<script>
+  const dropZone = document.getElementById('drop-zone');
+  const fileInput = document.getElementById('file-input');
+  const statusBox = document.getElementById('status-box');
+  const progressBar = document.getElementById('progress-bar');
+  const progressMsg = document.getElementById('progress-msg');
+  const downloadBtn = document.getElementById('download-btn');
+  const resetBtn = document.getElementById('reset-btn');
+  const errorBox = document.getElementById('error-box');
+  let pollTimer = null;
+
+  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault(); dropZone.classList.remove('dragover');
+    const file = e.dataTransfer.files[0];
+    if (file) handleFile(file);
+  });
+  dropZone.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => { if (fileInput.files[0]) handleFile(fileInput.files[0]); });
+
+  function handleFile(file) {
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      showError('Chỉ chấp nhận file PDF.');
+      return;
+    }
+    if (file.size > 100 * 1024 * 1024) {
+      showError('File quá lớn (tối đa 100MB).');
+      return;
+    }
+    uploadFile(file);
+  }
+
+  async function uploadFile(file) {
+    errorBox.style.display = 'none';
+    dropZone.style.display = 'none';
+    statusBox.style.display = 'block';
+    downloadBtn.style.display = 'none';
+    resetBtn.style.display = 'none';
+    progressBar.classList.add('indeterminate');
+    progressMsg.textContent = 'Đang tải lên...';
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const res = await fetch('/upload', { method: 'POST', body: formData });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        showError(data.detail || 'Lỗi khi tải file lên.');
+        return;
+      }
+      const { job_id } = await res.json();
+      pollStatus(job_id);
+    } catch (e) {
+      showError('Lỗi kết nối: ' + e.message);
+    }
+  }
+
+  function pollStatus(jobId) {
+    clearInterval(pollTimer);
+    pollTimer = setInterval(async () => {
+      try {
+        const res = await fetch(`/status/${jobId}`);
+        if (!res.ok) { clearInterval(pollTimer); showError('Không thể kiểm tra trạng thái.'); return; }
+        const data = await res.json();
+        progressMsg.textContent = data.progress || 'Đang xử lý...';
+
+        if (data.status === 'done') {
+          clearInterval(pollTimer);
+          progressBar.classList.remove('indeterminate');
+          progressBar.style.width = '100%';
+          progressBar.style.background = '#38a169';
+          downloadBtn.href = data.download_url;
+          downloadBtn.style.display = 'inline-block';
+          resetBtn.style.display = 'block';
+        } else if (data.status === 'error') {
+          clearInterval(pollTimer);
+          showError(data.error || 'Đã xảy ra lỗi khi xử lý.');
+        }
+      } catch (e) {
+        // network glitch, keep polling
+      }
+    }, 1500);
+  }
+
+  function showError(msg) {
+    dropZone.style.display = 'block';
+    statusBox.style.display = 'none';
+    errorBox.textContent = '⚠️ ' + msg;
+    errorBox.style.display = 'block';
+  }
+
+  resetBtn.addEventListener('click', () => {
+    clearInterval(pollTimer);
+    dropZone.style.display = 'block';
+    statusBox.style.display = 'none';
+    errorBox.style.display = 'none';
+    fileInput.value = '';
+    progressBar.style.width = '10%';
+    progressBar.style.background = '#4299e1';
+  });
+</script>
+</body>
+</html>

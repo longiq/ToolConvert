@@ -22,6 +22,12 @@ _HEADER_RE = re.compile(
     r"đơn\s*giá|thành\s*tiền|ghi\s*chú|lĩnh\s*vực)\b",
     re.IGNORECASE,
 )
+# Matches "19 HỘ KINH DOANH..." — STT number merged with name in col-0
+_STT_MERGED_RE = re.compile(r"^(\d{1,3})\s{1,4}(.+)$")
+# Section heading patterns like "I.", "II.", "III." or "1.", "2."
+_SECTION_HEADING_RE = re.compile(
+    r"^((?:[IVX]{1,5}|[0-9]{1,2})[\.\)]\s*.{5,})", re.IGNORECASE
+)
 
 MIN_COL_GAP = 100  # px at 300 DPI ~ 8mm — avoids false splits on large-font centered titles
 ROW_TOLERANCE = 18  # px: words within this y-range are on the same visual line
@@ -282,9 +288,38 @@ def build_tables_from_ocr(page_ocr_list: list, progress_cb=None) -> list[TableDa
                 table_bands.clear()
                 return
 
+            # Fix 1: split leading STT number merged into col-0
+            if data_rows:
+                sample_col0 = [r[0] for r in data_rows[:5] if r and r[0].strip()]
+                n_merged = sum(1 for c in sample_col0 if _STT_MERGED_RE.match(c.strip()))
+                if n_merged >= max(1, len(sample_col0) * 0.4):
+                    new_rows = []
+                    for r in data_rows:
+                        c0 = r[0].strip() if r else ""
+                        m = _STT_MERGED_RE.match(c0)
+                        if m:
+                            new_rows.append([m.group(1), m.group(2)] + list(r[1:]))
+                        else:
+                            new_rows.append(list(r))
+                    data_rows = new_rows
+                    # Also split header if it appears merged
+                    if headers and _HEADER_RE.search(headers[0]) and len(headers) > 1 and not headers[1].strip():
+                        headers = ["STT"] + [h if h.strip() else "" for h in headers]
+                        headers[1] = headers[1] or (headers[2] if len(headers) > 2 else "")
+
             is_summary_flags = [_is_summary(r[0] if r else "") for r in data_rows]
-            title = pending_meta[-1].strip() if pending_meta else f"Bảng {len(tables) + 1}"
-            meta = [m for m in pending_meta[:-1] if m.strip()] if len(pending_meta) > 1 else []
+
+            # Fix 2: prefer section heading from metadata as title
+            title = f"Bảng {len(tables) + 1}"
+            for m_line in pending_meta:
+                if _SECTION_HEADING_RE.match(m_line.strip()):
+                    title = m_line.strip()
+                    break
+            else:
+                if pending_meta:
+                    title = pending_meta[-1].strip() or title
+
+            meta = [m for m in pending_meta if m.strip() and m.strip() != title] if pending_meta else []
 
             tables.append(TableData(
                 title=title,

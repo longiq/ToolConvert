@@ -19,17 +19,20 @@ _SUMMARY_RE = re.compile(
 _HEADER_RE = re.compile(
     r"\b(stt|s\.tt|số\s*tt|số\s*thứ\s*tự|tên\s*cơ\s*sở|địa\s*chỉ|họ\s*tên|"
     r"họ\s*và\s*tên|no\.|name|address|description|đơn\s*vị|số\s*lượng|"
-    r"đơn\s*giá|thành\s*tiền|ghi\s*chú|lĩnh\s*vực)\b",
+    r"đơn\s*giá|thành\s*tiền|ghi\s*chú)\b",
     re.IGNORECASE,
 )
 # Matches leading STT number merged with cell text, e.g. "19 HỘ KINH DOANH..."
 _STT_MERGED_RE = re.compile(r"^(\d{1,3})\s{1,4}(.+)$")
 # Matches Roman-numeral or numbered section headings, e.g. "I. DANH SÁCH..."
 _SECTION_HEADING_RE = re.compile(
-    r"^((?:[IVX]{1,5}|[0-9]{1,2})[\.\)]\s*.{5,})", re.IGNORECASE
+    r"^(?:[IVXLivxl]{1,5}|[0-9]{1,2})[\.\)]\s*.{5,}"  # Roman/digit heading (L covers OCR-misread II)
+    r"|DANH\s*SÁCH|LĨNH\s*VỰC",
+    re.IGNORECASE,
 )
 
 MIN_COL_GAP = 100  # px at 300 DPI ~ 8mm — avoids false splits on large-font centered titles
+META_WIDTH_RATIO = 0.44  # band must span > this fraction of page to be metadata
 ROW_TOLERANCE = 18  # px: words within this y-range are on the same visual line
 ROW_SPLIT_GAP = 50  # px: vertical gap larger than this → new row band
 
@@ -162,7 +165,7 @@ def _build_cell_grid(df, boundaries: list[int]) -> list[dict]:
         cells_filled = [bool(c.strip()) for c in band_data["cells"]]
         only_first_col = cells_filled[0] and not any(cells_filled[1:])
         span = band_data["max_right"] - band_data["min_left"]
-        is_wide = span > page_width_est * 0.55
+        is_wide = span > page_width_est * META_WIDTH_RATIO
         band_data["is_meta"] = only_first_col and is_wide
 
     return sorted(rows.values(), key=lambda r: r["band"])
@@ -192,8 +195,11 @@ def _merge_continuation_rows(bands: list[dict], page_height: int) -> list[dict]:
         if band["is_meta"] and i + 1 < len(bands):
             next_band = bands[i + 1]
             gap = next_band["top"] - band["top"]
-            # Continuation: small gap, next band has content in col > 0
-            if gap < ROW_SPLIT_GAP * 3 and not next_band["is_meta"]:
+            next_text = " ".join(c for c in next_band["cells"] if c)
+            # Don't merge if: gap too large, next band is also meta,
+            # OR next band looks like a section header row
+            is_next_header = bool(_HEADER_RE.search(next_text))
+            if gap < ROW_SPLIT_GAP * 3 and not next_band["is_meta"] and not is_next_header:
                 # Merge: prepend current band's col-0 into next band's col-0
                 merged_cells = list(next_band["cells"])
                 prefix = band["cells"][0]
@@ -311,17 +317,21 @@ def build_tables_from_ocr(page_ocr_list: list, progress_cb=None) -> list[TableDa
 
             is_summary_flags = [_is_summary(r[0] if r else "") for r in data_rows]
 
-            # Fix 2: prefer section heading from metadata as title
+            # Prefer section heading from metadata as title; join multi-line headings
             title = f"Bảng {len(tables) + 1}"
+            heading_found = False
             for m_line in pending_meta:
-                if _SECTION_HEADING_RE.match(m_line.strip()):
-                    title = m_line.strip()
+                if _SECTION_HEADING_RE.search(m_line.strip()):
+                    heading_found = True
                     break
-            else:
-                if pending_meta:
-                    candidate = pending_meta[-1].strip()
-                    if len(candidate) >= 5:  # skip meaningless short values like "2", "3"
-                        title = candidate
+            if heading_found:
+                # Join all meta lines to reconstruct the full heading
+                full = " ".join(m.strip() for m in pending_meta if m.strip())
+                title = full if full else title
+            elif pending_meta:
+                candidate = pending_meta[-1].strip()
+                if len(candidate) >= 5:
+                    title = candidate
 
             meta = [m for m in pending_meta if m.strip() and m.strip() != title] if pending_meta else []
 
@@ -364,4 +374,45 @@ def build_tables_from_ocr(page_ocr_list: list, progress_cb=None) -> list[TableDa
                     is_summary_row=[False],
                 ))
 
-    return tables
+    # Remove tables that have no recognizable column headers (cover letter / free text noise)
+    tables = [t for t in tables if _HEADER_RE.search(" ".join(t.headers))]
+    return _merge_page_continuations(tables)
+
+
+_GENERIC_TITLE_RE = re.compile(r'^(Bảng \d+|Nội dung trang \d+)$')
+
+
+def _merge_page_continuations(tables: list[TableData]) -> list[TableData]:
+    """Merge consecutive tables that are page-continuations of the same section.
+    A table is a continuation if it has a generic auto-generated title ('Bảng N')
+    and the same normalized column headers as the preceding table.
+    """
+    if not tables:
+        return tables
+
+    def norm_hdrs(t: TableData) -> tuple:
+        return tuple(h.strip().upper()[:15] for h in t.headers if h.strip())
+
+    merged: list[TableData] = []
+    i = 0
+    while i < len(tables):
+        current = tables[i]
+        j = i + 1
+        while j < len(tables):
+            nxt = tables[j]
+            if (norm_hdrs(current) == norm_hdrs(nxt)
+                    and bool(_GENERIC_TITLE_RE.match(nxt.title))):
+                current = TableData(
+                    title=current.title,
+                    metadata=current.metadata,
+                    headers=current.headers,
+                    rows=current.rows + nxt.rows,
+                    page=current.page,
+                    is_summary_row=current.is_summary_row + nxt.is_summary_row,
+                )
+                j += 1
+            else:
+                break
+        merged.append(current)
+        i = j
+    return merged

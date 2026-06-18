@@ -302,10 +302,12 @@ def build_tables_from_ocr(page_ocr_list: list, progress_cb=None) -> list[TableDa
                         else:
                             new_rows.append(list(r))
                     data_rows = new_rows
-                    # Also split header if it appears merged
-                    if headers and _HEADER_RE.search(headers[0]) and len(headers) > 1 and not headers[1].strip():
-                        headers = ["STT"] + [h if h.strip() else "" for h in headers]
-                        headers[1] = headers[1] or (headers[2] if len(headers) > 2 else "")
+                    # Fix header: normalize to ["STT", "TÊN CƠ SỞ", ...]
+                    if headers:
+                        h0 = headers[0]
+                        if "STT" in h0.upper() and ("TÊN" in h0.upper() or "CƠ SỞ" in h0.upper()):
+                            # "STT TÊN CƠ SỞ" or "... STT TÊN CƠ SỞ" merged in col 0
+                            headers = ["STT", "TÊN CƠ SỞ"] + [h for h in headers[1:] if h.strip()]
 
             is_summary_flags = [_is_summary(r[0] if r else "") for r in data_rows]
 
@@ -317,7 +319,9 @@ def build_tables_from_ocr(page_ocr_list: list, progress_cb=None) -> list[TableDa
                     break
             else:
                 if pending_meta:
-                    title = pending_meta[-1].strip() or title
+                    candidate = pending_meta[-1].strip()
+                    if len(candidate) >= 5:  # skip meaningless short values like "2", "3"
+                        title = candidate
 
             meta = [m for m in pending_meta if m.strip() and m.strip() != title] if pending_meta else []
 

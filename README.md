@@ -7,7 +7,7 @@ Chuyển đổi file PDF thành Excel (.xlsx). Chạy hoàn toàn **local / self
 - Upload PDF qua giao diện web drag-and-drop
 - Tự động phát hiện loại PDF:
   - **PDF text** (có layer text) → dùng `pdfplumber` để trích xuất bảng
-  - **PDF scan** (ảnh chụp) → dùng `Tesseract OCR` (hỗ trợ tiếng Việt + tiếng Anh)
+  - **PDF scan** (ảnh chụp) → dùng OCR. Mặc định **EasyOCR** (neural network, chạy local, độ chính xác tiếng Việt cao). Có thể chuyển về `Tesseract` qua biến môi trường `OCR_ENGINE=tesseract`.
 - Mỗi bảng → 1 sheet riêng trong Excel
 - Sheet "Tổng quan" tổng hợp toàn bộ nội dung PDF theo thứ tự
 - Header row: bold + freeze panes
@@ -45,9 +45,18 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+## Cấu hình (biến môi trường)
+
+| Biến | Mặc định | Mô tả |
+|------|----------|-------|
+| `OCR_ENGINE` | `easyocr` | `easyocr` (chính xác hơn) hoặc `tesseract` (nhẹ, nhanh hơn) |
+| `OCR_DPI` | `220` | DPI render ảnh từ PDF scan trước khi OCR |
+
+> EasyOCR tải model (~100MB) ở lần chạy đầu và chạy chậm hơn trên CPU (vài phút/tài liệu). Tesseract nhanh hơn nhưng độ chính xác tiếng Việt thấp hơn.
+
 ## Giới hạn
 
-- **PDF scan**: Chất lượng phụ thuộc vào độ phân giải và độ rõ của bản scan. Tesseract OCR không có độ chính xác 100% với mọi font/layout.
+- **PDF scan**: Chất lượng phụ thuộc vào độ phân giải và độ rõ của bản scan. OCR không có độ chính xác 100% với mọi font/layout. EasyOCR cho kết quả tốt hơn Tesseract đáng kể với tiếng Việt.
 - **Bảng phức tạp**: Bảng có nhiều cột merged, header nhiều dòng có thể không detect chính xác.
 - **PDF mã hóa/bảo mật**: Không hỗ trợ.
 - Kích thước tối đa: 100MB/file.

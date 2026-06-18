@@ -22,9 +22,9 @@ _HEADER_RE = re.compile(
     r"đơn\s*giá|thành\s*tiền|ghi\s*chú|lĩnh\s*vực)\b",
     re.IGNORECASE,
 )
-# Matches "19 HỘ KINH DOANH..." — STT number merged with name in col-0
+# Matches leading STT number merged with cell text, e.g. "19 HỘ KINH DOANH..."
 _STT_MERGED_RE = re.compile(r"^(\d{1,3})\s{1,4}(.+)$")
-# Section heading patterns like "I.", "II.", "III." or "1.", "2."
+# Matches Roman-numeral or numbered section headings, e.g. "I. DANH SÁCH..."
 _SECTION_HEADING_RE = re.compile(
     r"^((?:[IVX]{1,5}|[0-9]{1,2})[\.\)]\s*.{5,})", re.IGNORECASE
 )

@@ -324,16 +324,21 @@ def build_tables_from_ocr(page_ocr_list: list, progress_cb=None) -> list[TableDa
                 if _SECTION_HEADING_RE.search(m_line.strip()):
                     heading_found = True
                     break
+            consumed_meta = False
             if heading_found:
                 # Join all meta lines to reconstruct the full heading
                 full = " ".join(m.strip() for m in pending_meta if m.strip())
                 title = full if full else title
+                consumed_meta = True  # all meta lines folded into the title
             elif pending_meta:
                 candidate = pending_meta[-1].strip()
                 if len(candidate) >= 5:
                     title = candidate
 
-            meta = [m for m in pending_meta if m.strip() and m.strip() != title] if pending_meta else []
+            if consumed_meta:
+                meta = []
+            else:
+                meta = [m for m in pending_meta if m.strip() and m.strip() != title] if pending_meta else []
 
             tables.append(TableData(
                 title=title,
@@ -376,7 +381,136 @@ def build_tables_from_ocr(page_ocr_list: list, progress_cb=None) -> list[TableDa
 
     # Remove tables that have no recognizable column headers (cover letter / free text noise)
     tables = [t for t in tables if _HEADER_RE.search(" ".join(t.headers))]
-    return _merge_page_continuations(tables)
+    tables = _merge_page_continuations(tables)
+    tables = [_reconstruct_listing(t) for t in tables]
+    for t in tables:
+        t.sheet_name = _sheet_name_from_title(t.title)
+    return tables
+
+
+# ---------------------------------------------------------------------------
+# Business-listing reconstruction (STT | TÊN CƠ SỞ | ĐỊA CHỈ)
+# ---------------------------------------------------------------------------
+
+# A cell is an address if it starts with a house number or known location prefix
+_ADDR_PREFIX_RE = re.compile(r"^(TK|HẺM|SỐ|PHÍA|BSIA)", re.IGNORECASE)
+_LISTING_HDR_RE = re.compile(r"tên\s*cơ\s*sở", re.IGNORECASE)
+_HO_KINH_DOANH_RE = re.compile(r"KINH\s*DOANH")
+
+
+def _looks_like_address(text: str) -> bool:
+    t = text.lstrip("[").strip()
+    if not t:
+        return False
+    if _HO_KINH_DOANH_RE.search(t.upper()):
+        return False  # contains "KINH DOANH" → it's a business name
+    if re.match(r"^\d", t):  # starts with a house number
+        return True
+    return bool(_ADDR_PREFIX_RE.match(t))
+
+
+def _parse_listing_row(row: list[str]):
+    """Return (stt|None, name_fragment, addr_fragment) for one OCR row."""
+    stt = None
+    name_parts: list[str] = []
+    addr_parts: list[str] = []
+    for c in row:
+        c = (c or "").strip()
+        if not c:
+            continue
+        if stt is None and re.fullmatch(r"\d{1,3}", c):
+            stt = c
+            continue
+        m = re.match(r"^(\d{1,3})\s+(.+)$", c)
+        if stt is None and m and _HO_KINH_DOANH_RE.search(m.group(2).upper()):
+            stt = m.group(1)
+            c = m.group(2)
+        cleaned = c.lstrip("[").strip()
+        if _looks_like_address(c):
+            addr_parts.append(cleaned)
+        else:
+            name_parts.append(cleaned)
+    return stt, " ".join(name_parts), " ".join(addr_parts)
+
+
+def _reconstruct_listing(table: TableData) -> TableData:
+    """Rebuild fragmented OCR rows of a 'STT | TÊN CƠ SỞ | ĐỊA CHỈ' listing into
+    one logical entry per business, using sequential STT numbering as anchors."""
+    if not _LISTING_HDR_RE.search(" ".join(table.headers)):
+        return table
+
+    entries: list[list[str]] = []  # [stt, name, addr]
+    by_stt: dict[int, list[str]] = {}
+    current: list[str] | None = None
+    expected = 1
+
+    def get_or_create(stt_int: int) -> list[str]:
+        if stt_int in by_stt:
+            return by_stt[stt_int]
+        e = [str(stt_int), "", ""]
+        entries.append(e)
+        by_stt[stt_int] = e
+        return e
+
+    for row in table.rows:
+        stt, name_frag, addr_frag = _parse_listing_row(row)
+        is_new_business = bool(name_frag and _HO_KINH_DOANH_RE.search(name_frag.upper()))
+
+        if stt is not None and stt.isdigit():
+            si = int(stt)
+            current = get_or_create(si)
+            expected = si + 1
+        elif is_new_business:
+            current = get_or_create(expected)
+            expected += 1
+        elif current is None:
+            current = get_or_create(expected)
+            expected += 1
+
+        if name_frag:
+            current[1] = (current[1] + " " + name_frag).strip()
+        if addr_frag:
+            current[2] = (current[2] + " " + addr_frag).strip()
+
+    # Clean: collapse whitespace, drop a trailing/standalone STT number left in the name
+    cleaned_rows = []
+    for stt, name, addr in entries:
+        name = re.sub(r"\s+", " ", name).strip()
+        # remove the entry's own STT if it leaked into the name as a standalone token
+        name = re.sub(rf"\b{re.escape(stt)}\b", "", name).strip()
+        name = re.sub(r"\s+", " ", name).strip()
+        addr = re.sub(r"\s+", " ", addr).strip()
+        cleaned_rows.append([stt, name, addr])
+
+    return TableData(
+        title=table.title,
+        metadata=table.metadata,
+        headers=["STT", "TÊN CƠ SỞ", "ĐỊA CHỈ"],
+        rows=cleaned_rows,
+        page=table.page,
+        is_summary_row=[False] * len(cleaned_rows),
+    )
+
+
+def _sheet_name_from_title(title: str) -> str | None:
+    """Derive a concise sheet name (e.g. 'Y tế - Chưa cấp GCN') from a section title."""
+    up = title.upper()
+    linh_vuc = None
+    if "Y TẾ" in up:
+        linh_vuc = "Y tế"
+    elif "CÔNG THƯƠNG" in up:
+        linh_vuc = "Công thương"
+    elif "NÔNG NGHIỆP" in up:
+        linh_vuc = "Nông nghiệp"
+    if not linh_vuc:
+        return None
+    if "CHƯA ĐƯỢC CẤP" in up or "CHƯA CẤP" in up:
+        status = "Chưa cấp GCN"
+    elif "KHÔNG THUỘC" in up or "KHÔNG CẤP" in up:
+        status = "Không cấp GCN"
+    else:
+        status = ""
+    return f"{linh_vuc} - {status}".strip(" -")
 
 
 _GENERIC_TITLE_RE = re.compile(r'^(Bảng \d+|Nội dung trang \d+)$')

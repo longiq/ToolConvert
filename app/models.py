@@ -18,6 +18,7 @@ class TableData:
     rows: list[list[str]]
     page: int
     is_summary_row: list[bool] = field(default_factory=list)
+    sheet_name: Optional[str] = None
 
     def __post_init__(self):
         if not self.is_summary_row:

@@ -104,7 +104,8 @@ def write_excel(tables: list[TableData], output_path: str) -> str:
 
     # Individual sheets per table
     for table in tables:
-        sheet_name = _safe_sheet_name(table.title or f"Bảng {len(existing_names)}", existing_names)
+        preferred = table.sheet_name or table.title or f"Bảng {len(existing_names)}"
+        sheet_name = _safe_sheet_name(preferred, existing_names)
         ws = wb.create_sheet(title=sheet_name)
         _write_table_to_sheet(ws, table, start_row=1, freeze=True)
         _auto_col_widths(ws)

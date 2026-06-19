@@ -9,6 +9,7 @@ Pass 2 – Assign every word to a (row_band, col_idx) cell.
           Full-width bands with no clear column split → metadata.
 """
 import re
+import unicodedata
 import numpy as np
 from .models import TableData
 
@@ -575,8 +576,13 @@ def _merge_page_continuations(tables: list[TableData]) -> list[TableData]:
     if not tables:
         return tables
 
-    def norm_hdrs(t: TableData) -> tuple:
-        return tuple(h.strip().upper()[:15] for h in t.headers if h.strip())
+    def norm_hdrs(t: TableData) -> str:
+        # Join all headers, strip diacritics to ASCII so OCR inconsistencies
+        # (missing accents, merged columns) still produce the same key.
+        combined = " ".join(h.strip() for h in t.headers if h.strip()).upper()
+        nfkd = unicodedata.normalize("NFKD", combined)
+        ascii_key = re.sub(r"\s+", "", "".join(c for c in nfkd if not unicodedata.combining(c)))
+        return ascii_key[:35]
 
     merged: list[TableData] = []
     i = 0

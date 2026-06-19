@@ -433,11 +433,44 @@ def _parse_listing_row(row: list[str]):
     return stt, " ".join(name_parts), " ".join(addr_parts)
 
 
+def _merge_overflow_rows_multicolumn(table: TableData) -> TableData:
+    """For multi-column tables: merge rows with empty col-0 into the previous row."""
+    result_rows: list[list[str]] = []
+    result_summary: list[bool] = []
+    for row_idx, row in enumerate(table.rows):
+        is_summary = table.is_summary_row[row_idx] if row_idx < len(table.is_summary_row) else False
+        if row and not row[0].strip() and result_rows:
+            prev = list(result_rows[-1])
+            for ci in range(1, max(len(row), len(prev))):
+                val = row[ci].strip() if ci < len(row) else ""
+                if val:
+                    if ci < len(prev):
+                        prev[ci] = (prev[ci] + " " + val).strip()
+                    else:
+                        prev.append(val)
+            result_rows[-1] = prev
+        else:
+            result_rows.append(list(row))
+            result_summary.append(is_summary)
+    return TableData(
+        title=table.title,
+        metadata=table.metadata,
+        headers=table.headers,
+        rows=result_rows,
+        page=table.page,
+        is_summary_row=result_summary,
+    )
+
+
 def _reconstruct_listing(table: TableData) -> TableData:
     """Rebuild fragmented OCR rows of a 'STT | TÊN CƠ SỞ | ĐỊA CHỈ' listing into
     one logical entry per business, using sequential STT numbering as anchors."""
     if not _LISTING_HDR_RE.search(" ".join(table.headers)):
         return table
+
+    # Multi-column tables (>3 cols): preserve all columns, only merge overflow rows
+    if len([h for h in table.headers if h.strip()]) > 3:
+        return _merge_overflow_rows_multicolumn(table)
 
     entries: list[list[str]] = []  # [stt, name, addr]
     by_stt: dict[int, list[str]] = {}
@@ -516,10 +549,28 @@ def _sheet_name_from_title(title: str) -> str | None:
 _GENERIC_TITLE_RE = re.compile(r'^(Bảng \d+|Nội dung trang \d+)$')
 
 
+def _is_continuation_title(title: str) -> bool:
+    """True if title looks like a page continuation, not a real section heading."""
+    t = (title or "").strip()
+    if not t:
+        return True
+    if _GENERIC_TITLE_RE.match(t):
+        return True
+    # Bare page numbers like "3", "4", "10" from PDF page number OCR
+    if re.match(r'^\d{1,3}$', t):
+        return True
+    return False
+
+
 def _merge_page_continuations(tables: list[TableData]) -> list[TableData]:
     """Merge consecutive tables that are page-continuations of the same section.
-    A table is a continuation if it has a generic auto-generated title ('Bảng N')
-    and the same normalized column headers as the preceding table.
+
+    A continuation is detected when: same normalized headers + the next table's
+    title is generic (Bảng N), empty, or a bare page number.
+
+    Also handles cross-page row overflow: if the first row of the continuation
+    page has an empty STT column (col 0), it is an overflow from the last row
+    of the previous page and is merged into that row.
     """
     if not tables:
         return tables
@@ -534,15 +585,34 @@ def _merge_page_continuations(tables: list[TableData]) -> list[TableData]:
         j = i + 1
         while j < len(tables):
             nxt = tables[j]
-            if (norm_hdrs(current) == norm_hdrs(nxt)
-                    and bool(_GENERIC_TITLE_RE.match(nxt.title))):
+            if norm_hdrs(current) == norm_hdrs(nxt) and _is_continuation_title(nxt.title):
+                cur_rows = list(current.rows)
+                cur_summary = list(current.is_summary_row)
+                nxt_rows = list(nxt.rows)
+                nxt_summary = list(nxt.is_summary_row)
+
+                # Cross-page overflow: first row of continuation has empty STT
+                if cur_rows and nxt_rows and not (nxt_rows[0][0].strip() if nxt_rows[0] else True):
+                    overflow = nxt_rows[0]
+                    last = list(cur_rows[-1])
+                    for ci in range(1, max(len(overflow), len(last))):
+                        val = overflow[ci].strip() if ci < len(overflow) else ""
+                        if val:
+                            if ci < len(last):
+                                last[ci] = (last[ci] + " " + val).strip()
+                            else:
+                                last.append(val)
+                    cur_rows[-1] = last
+                    nxt_rows = nxt_rows[1:]
+                    nxt_summary = nxt_summary[1:] if nxt_summary else []
+
                 current = TableData(
                     title=current.title,
                     metadata=current.metadata,
                     headers=current.headers,
-                    rows=current.rows + nxt.rows,
+                    rows=cur_rows + nxt_rows,
                     page=current.page,
-                    is_summary_row=current.is_summary_row + nxt.is_summary_row,
+                    is_summary_row=cur_summary + nxt_summary,
                 )
                 j += 1
             else:

@@ -72,6 +72,17 @@ def _process_pdf(job_id: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Pre-warm OCR model in background so first upload doesn't have to wait
+    import threading
+    def _warm_ocr():
+        try:
+            from .parser_ocr import _get_easyocr_reader, OCR_ENGINE
+            if OCR_ENGINE == "easyocr":
+                _get_easyocr_reader()
+        except Exception:
+            pass
+    threading.Thread(target=_warm_ocr, daemon=True).start()
+
     # Cleanup loop
     async def _periodic_cleanup():
         while True:

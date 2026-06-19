@@ -44,7 +44,7 @@
   <div class="drop-zone" id="drop-zone">
     <div class="icon">⬆️</div>
     <p>Kéo thả file PDF vào đây</p>
-    <p>hoặc <label for="file-input" style="color:#4299e1;cursor:pointer;text-decoration:underline">chọn file</label></p>
+    <p>hoặc <label for="file-input" style="color:#4299e1;cursor:pointer;text-decoration:underline" onclick="event.stopPropagation()">chọn file</label></p>
     <small>Tối đa 100MB</small>
   </div>
   <input type="file" id="file-input" accept=".pdf,application/pdf">

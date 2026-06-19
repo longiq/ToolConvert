@@ -93,4 +93,4 @@ def extract_from_scanned_pdf(filepath: str, progress_cb=None) -> list[TableData]
     if progress_cb:
         progress_cb("Đang phân tích cấu trúc bảng...")
 
-    return build_tables_from_ocr(ocr_pages, progress_cb=progress_cb)
+    return build_tables_from_ocr(ocr_pages, page_images=images, progress_cb=progress_cb)

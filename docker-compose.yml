@@ -12,3 +12,13 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    network_mode: "service:app"
+    depends_on:
+      - app

@@ -601,15 +601,109 @@ def _merge_overflow_rows_multicolumn(table: TableData) -> TableData:
     )
 
 
-def _reconstruct_listing(table: TableData) -> TableData:
-    """Rebuild fragmented OCR rows of a 'STT | TÊN CƠ SỞ | ĐỊA CHỈ' listing into
-    one logical entry per business, using sequential STT numbering as anchors."""
-    if not _LISTING_HDR_RE.search(" ".join(table.headers)):
+def _reconstruct_multicolumn_listing(table: TableData) -> TableData:
+    """Rebuild a fragmented multi-column OCR listing into one row per business.
+
+    Scanned bordered tables split a single business across several OCR row-bands:
+    the STT number often lands in a middle band while the company name wraps across
+    the band above and the band below it. We anchor on "main bands" (a row carrying
+    an STT number OR a filled last/category column) — each is exactly one business —
+    and merge the fragment bands (no number, no category) into the right anchor:
+
+      * a fragment carrying a NAME attaches to the NEXT anchor (the name's first line
+        usually precedes the number band) — UNLESS the previous anchor originally had
+        no name, meaning this fragment is that anchor's wrapped second line;
+      * a fragment with only address/description overflow attaches to the PREVIOUS anchor.
+
+    Missing STT numbers are then filled in sequentially.
+    """
+    rows = table.rows
+    ncol = len(table.headers)
+    if ncol < 4 or not rows:
         return table
 
-    # Multi-column tables (>3 cols): preserve all columns, only merge overflow rows
-    if len([h for h in table.headers if h.strip()]) > 3:
+    last = ncol - 1
+
+    def cell(r, i):
+        return r[i].strip() if r and i < len(r) and r[i] else ""
+
+    def is_main(r):
+        col0 = cell(r, 0)
+        return bool(re.fullmatch(r"\d{1,3}", col0)) or bool(cell(r, last))
+
+    def has_name(r):
+        return bool(cell(r, 1))
+
+    main_idx = [i for i, r in enumerate(rows) if is_main(r)]
+    # Need a real sequential listing to safely reconstruct; otherwise leave as-is
+    numeric_main = [i for i in main_idx if re.fullmatch(r"\d{1,3}", cell(rows[i], 0))]
+    if len(numeric_main) < 3:
         return _merge_overflow_rows_multicolumn(table)
+
+    # One mutable entry per main band, padded to ncol
+    entries: list[list[str]] = []
+    pos_of_main: dict[int, int] = {}
+    main_orig_named: dict[int, bool] = {}
+    for k, i in enumerate(main_idx):
+        e = [cell(rows[i], c) for c in range(ncol)]
+        entries.append(e)
+        pos_of_main[i] = k
+        main_orig_named[i] = has_name(rows[i])
+
+    def merge_into(entry: list[str], frag: list[str]):
+        for ci in range(1, ncol):
+            val = cell(frag, ci)
+            if val:
+                entry[ci] = (entry[ci] + " " + val).strip()
+
+    for i, r in enumerate(rows):
+        if i in pos_of_main:
+            continue  # main band, already an entry
+        prev_main = max((m for m in main_idx if m < i), default=None)
+        next_main = min((m for m in main_idx if m > i), default=None)
+        if has_name(r) and next_main is not None and (
+            prev_main is None or main_orig_named.get(prev_main, False)
+        ):
+            target = next_main
+        elif prev_main is not None:
+            target = prev_main
+        else:
+            target = next_main
+        if target is not None:
+            merge_into(entries[pos_of_main[target]], r)
+
+    # Fill STT sequentially, collapse whitespace
+    out: list[list[str]] = []
+    expected = 1
+    for entry in entries:
+        col0 = entry[0].strip()
+        if re.fullmatch(r"\d{1,3}", col0):
+            stt = int(col0)
+        else:
+            stt = expected
+            entry[0] = str(stt)
+        expected = stt + 1
+        out.append([re.sub(r"\s+", " ", c).strip() for c in entry])
+
+    return TableData(
+        title=table.title,
+        metadata=table.metadata,
+        headers=table.headers,
+        rows=out,
+        page=table.page,
+        is_summary_row=[False] * len(out),
+    )
+
+
+def _reconstruct_listing(table: TableData) -> TableData:
+    """Rebuild fragmented OCR rows of a 'STT | TÊN CƠ SỞ | ĐỊA CHỉ' listing into
+    one logical entry per business, using sequential STT numbering as anchors."""
+    # Multi-column tables (>3 cols): reconstruct using STT-anchored block grouping
+    if len([h for h in table.headers if h.strip()]) > 3:
+        return _reconstruct_multicolumn_listing(table)
+
+    if not _LISTING_HDR_RE.search(" ".join(table.headers)):
+        return table
 
     entries: list[list[str]] = []  # [stt, name, addr]
     by_stt: dict[int, list[str]] = {}

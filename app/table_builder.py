@@ -8,6 +8,7 @@ Pass 2 – Assign every word to a (row_band, col_idx) cell.
           Col idx is determined by word x-position vs boundaries.
           Full-width bands with no clear column split → metadata.
 """
+import bisect
 import re
 import unicodedata
 import numpy as np
@@ -53,20 +54,39 @@ def _clean_df(df):
     return df
 
 
-def _cluster_y(tops: list[float], tolerance: int = ROW_TOLERANCE) -> list[int]:
-    """Return a row-band index for each top value (same group ≤ tolerance apart)."""
+def _cluster_y(tops: list[float], tolerance: int = ROW_TOLERANCE,
+               row_boundaries: list[int] = None,
+               centers: list[float] = None) -> list[int]:
+    """Return a row-band index for each top value (same group ≤ tolerance apart).
+
+    When row_boundaries (y-positions of detected horizontal table lines) are provided,
+    uses word CENTERS (not tops) for the boundary crossing check — centers are more
+    reliable because OCR bounding boxes often extend slightly above/below the actual
+    text, while the center of the bbox reliably falls inside the correct row.
+    """
     if not tops:
         return []
+    ctrs = centers if centers else tops
     order = sorted(range(len(tops)), key=lambda i: tops[i])
     labels = [0] * len(tops)
     current_group = 0
     prev_top = tops[order[0]]
+    prev_ctr = ctrs[order[0]]
     labels[order[0]] = 0
     for idx in order[1:]:
-        if tops[idx] - prev_top > tolerance:
+        curr_top = tops[idx]
+        curr_ctr = ctrs[idx]
+        hard_break = False
+        if row_boundaries:
+            # A horizontal line at y separates previous word (center below y? no—above)
+            # from current word (center at or above y? no—below). Break when a boundary
+            # falls strictly between prev center and current center.
+            hard_break = any(prev_ctr < y <= curr_ctr for y in row_boundaries)
+        if curr_top - prev_top > tolerance or hard_break:
             current_group += 1
         labels[idx] = current_group
-        prev_top = tops[idx]
+        prev_top = curr_top
+        prev_ctr = curr_ctr
     return labels
 
 
@@ -146,6 +166,71 @@ def _find_column_boundaries_from_lines(image_np) -> list[int]:
         return []
 
 
+def _find_row_boundaries_from_lines(image_np) -> list[int]:
+    """Detect horizontal table-border lines using morphological ops.
+    Returns sorted list of internal y-positions (between top and bottom borders).
+    Returns [] if fewer than 3 horizontal lines found.
+    """
+    try:
+        if image_np.ndim == 3:
+            gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = image_np.copy()
+
+        h, w = gray.shape
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        # Wide, flat kernel detects horizontal lines
+        kernel_w = max(w // 6, 40)
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 1))
+        horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
+
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        horizontal_lines = cv2.dilate(horizontal_lines, dilate_kernel, iterations=1)
+
+        contours, _ = cv2.findContours(horizontal_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        y_positions = []
+        min_x_span = w * 0.25
+
+        for cnt in contours:
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            if ch < 20 and cw >= min_x_span:
+                y_center = y + ch // 2
+                y_positions.append(y_center)
+
+        if len(y_positions) < 3:
+            return []
+
+        y_positions.sort()
+        clusters: list[list[int]] = []
+        for y in y_positions:
+            if clusters and abs(y - clusters[-1][-1]) <= 15:
+                clusters[-1].append(y)
+            else:
+                clusters.append([y])
+
+        line_ys = sorted(int(np.median(c)) for c in clusters)
+
+        if len(line_ys) < 3:
+            return []
+
+        filtered_ys: list[int] = [line_ys[0]]
+        for y in line_ys[1:]:
+            if y - filtered_ys[-1] >= 20:
+                filtered_ys.append(y)
+        line_ys = filtered_ys
+
+        if len(line_ys) < 3:
+            return []
+
+        # Return internal y-positions (strip outermost top/bottom borders)
+        return line_ys[1:-1]
+
+    except Exception:
+        return []
+
+
 def _find_column_boundaries(df) -> list[int]:
     """
     Find x-positions of large inter-word gaps that repeat across many lines.
@@ -196,20 +281,57 @@ def _find_column_boundaries(df) -> list[int]:
 # Build cell grid from all words given boundaries
 # ---------------------------------------------------------------------------
 
-def _build_cell_grid(df, boundaries: list[int]) -> list[dict]:
+def _build_cell_grid(df, boundaries: list[int], row_boundaries: list[int] = None) -> list[dict]:
     """
     Returns list of row-band dicts:
       { "band": int, "top": float, "cells": list[str], "is_meta": bool }
+
+    When row_boundaries (horizontal line y-positions) are provided, words are assigned
+    to rows by which horizontal band they fall in — eliminating cross-row OCR bleeding.
     """
     df = _clean_df(df)
     if df.empty:
         return []
 
     num_cols = len(boundaries) + 1
-    tops = df["top"].tolist()
-    labels = _cluster_y(tops)
     df = df.copy()
-    df["row_band"] = labels
+
+    if row_boundaries:
+        # Hybrid row assignment:
+        # - Words whose CENTER falls between two detected horizontal lines → bisect (hard boundary,
+        #   prevents cross-row bleeding within the bordered table area).
+        # - Words above the first detected line (pre-table area: noise, section headings, column
+        #   headers) → Y-clustering (preserves natural separation between header and title text).
+        first_rb = row_boundaries[0]
+        tops_list = df["top"].tolist()
+        hts_list = df.get("height", [0] * len(df)).tolist() if "height" in df.columns else [0] * len(df)
+
+        bisect_labels = []
+        pre_mask = []
+        for top, ht in zip(tops_list, hts_list):
+            center = float(top) + float(ht) / 2
+            if center < first_rb:
+                bisect_labels.append(None)  # will fill with Y-cluster
+                pre_mask.append(True)
+            else:
+                bisect_labels.append(bisect.bisect_right(row_boundaries, center))
+                pre_mask.append(False)
+
+        # Y-cluster the pre-boundary words, map them to large negatives to avoid collision
+        pre_indices = [i for i, m in enumerate(pre_mask) if m]
+        if pre_indices:
+            pre_tops = [tops_list[i] for i in pre_indices]
+            pre_cluster_labels = _cluster_y(pre_tops)
+            max_pre = max(pre_cluster_labels) if pre_cluster_labels else 0
+            for local_idx, global_idx in enumerate(pre_indices):
+                # Map to -(max_pre + 1) … -1 so they sort before bisect bands (1, 2, …)
+                bisect_labels[global_idx] = pre_cluster_labels[local_idx] - max_pre - 1
+
+        df["row_band"] = bisect_labels
+    else:
+        tops = df["top"].tolist()
+        labels = _cluster_y(tops)
+        df["row_band"] = labels
 
     rows: dict[int, dict] = {}
     for _, row in df.iterrows():
@@ -341,7 +463,15 @@ def build_tables_from_ocr(page_ocr_list: list, page_images: list = None, progres
                 ))
             continue
 
-        bands = _build_cell_grid(df, boundaries)
+        # Detect horizontal row boundaries — prevents cross-row OCR text bleeding
+        row_boundaries: list[int] = []
+        if page_images is not None and page_idx < len(page_images):
+            try:
+                row_boundaries = _find_row_boundaries_from_lines(img_np)
+            except Exception:
+                row_boundaries = []
+
+        bands = _build_cell_grid(df, boundaries, row_boundaries=row_boundaries or None)
         bands = _merge_continuation_rows(bands, page_height)
 
         # Segment bands into alternating metadata/table sections
@@ -366,11 +496,14 @@ def build_tables_from_ocr(page_ocr_list: list, page_images: list = None, progres
             rows_data = [b["cells"] for b in table_bands]
 
             # Find header row
-            header_idx = 0
+            header_idx = None
             for i, row in enumerate(rows_data[:4]):
                 if _HEADER_RE.search(" ".join(row)):
                     header_idx = i
                     break
+
+            if header_idx is None:
+                header_idx = 0
 
             for r in rows_data[:header_idx]:
                 pending_meta.append(" ".join(c for c in r if c).strip())
@@ -441,9 +574,12 @@ def build_tables_from_ocr(page_ocr_list: list, page_images: list = None, progres
             pending_meta.clear()
 
         prev_top: float | None = None
+        # With hard row boundaries each band = one full table row, so consecutive bands
+        # can have large pixel gaps. Only split on metadata rows in that case.
+        gap_threshold = ROW_SPLIT_GAP * 40 if row_boundaries else ROW_SPLIT_GAP * 4
 
         for band in bands:
-            if prev_top is not None and (band["top"] - prev_top) > ROW_SPLIT_GAP * 4:
+            if prev_top is not None and (band["top"] - prev_top) > gap_threshold:
                 flush_table_bands()
 
             # Fix 1: upgrade multi-column bands matching section headings to metadata
@@ -477,7 +613,12 @@ def build_tables_from_ocr(page_ocr_list: list, page_images: list = None, progres
 
     # Keep tables that look like real listings (recognizable header keywords OR sequential row numbers)
     def _looks_like_listing(t: TableData) -> bool:
-        if _HEADER_RE.search(" ".join(t.headers)):
+        # Pages with many columns and high starting STT are continuation pages — keep even if few rows
+        if t.rows and len(t.headers) >= 3:
+            first_stt = str(t.rows[0][0]).strip() if t.rows[0] else ""
+            if re.match(r"^\d+$", first_stt) and int(first_stt) > 10:
+                return True
+        if _HEADER_RE.search(" ".join(t.headers)) and len(t.rows) > 3:
             return True
         seq_nums = sorted(set(
             int(c) for r in t.rows[:20]
@@ -493,14 +634,41 @@ def build_tables_from_ocr(page_ocr_list: list, page_images: list = None, progres
     tables = [t for t in tables if t.rows]  # drop tables emptied by garbage stripping
     tables = [_reconstruct_listing(t) for t in tables]
     for t in tables:
-        t.sheet_name = _sheet_name_from_title(t.title)
+        sheet = _sheet_name_from_title(t.title)
+        if sheet is None:
+            joined = " ".join(t.headers).upper()
+            if any(k in joined for k in ["HỌ VÀ TÊN NGƯỜI KINH DOANH", "LOẠI HÌNH", "LOAI HINH"]):
+                sheet = "II. Đã cam kết"
+            elif any(k in joined for k in ["TÊN CƠ SỞ", "LHKD", "DKKD", "LĨNH VỰC"]):
+                sheet = "I. Có GCN ATTP"
+        t.sheet_name = sheet
     return tables
+
+
+_FOOTER_PHRASE_RE = re.compile(
+    r"\b(PHÒNG\s+VĂN\s+HÓA[\s\-–]*XÃ\s+HỘI[\s\w]*BÌNH\s+LỢI"
+    r"|NƠI\s+NHẬN|TM\.?\s*ỦY\s*BAN|KT\.?\s*TRƯỞNG\s*PHÒNG"
+    r"|TRƯỞNG\s*PHÒNG|PHÓ\s*TRƯỞNG\s*PHÒNG"
+    r"|\bMac\b)",
+    re.IGNORECASE,
+)
 
 
 def _strip_trailing_garbage(table: TableData) -> TableData:
     """Remove trailing rows that look like document footers/signatures (non-numeric col-0, rest empty)."""
     rows = list(table.rows)
     summary = list(table.is_summary_row)
+
+    # Clean footer/signature phrases that OCR leaked into the last data row's cells
+    # (e.g. "...PHÒNG VĂN HÓA - XÃ HỘI XÃ BÌNH LỢI", trailing "Mac" from signature block).
+    if rows:
+        last = list(rows[-1])
+        for ci, val in enumerate(last):
+            s = str(val)
+            s = _FOOTER_PHRASE_RE.sub("", s)
+            last[ci] = re.sub(r"\s+", " ", s).strip()
+        rows[-1] = last
+
     while rows:
         r = rows[-1]
         is_empty = not any(str(c).strip() for c in r)
@@ -699,7 +867,7 @@ def _reconstruct_listing(table: TableData) -> TableData:
     """Rebuild fragmented OCR rows of a 'STT | TÊN CƠ SỞ | ĐỊA CHỉ' listing into
     one logical entry per business, using sequential STT numbering as anchors."""
     # Multi-column tables (>3 cols): reconstruct using STT-anchored block grouping
-    if len([h for h in table.headers if h.strip()]) > 3:
+    if len(table.headers) > 3:
         return _reconstruct_multicolumn_listing(table)
 
     if not _LISTING_HDR_RE.search(" ".join(table.headers)):
@@ -759,8 +927,15 @@ def _reconstruct_listing(table: TableData) -> TableData:
 
 
 def _sheet_name_from_title(title: str) -> str | None:
-    """Derive a concise sheet name (e.g. 'Y tế - Chưa cấp GCN') from a section title."""
+    """Derive a concise sheet name from a section title."""
     up = title.upper()
+    # ATTP-specific sections
+    if any(k in up for k in ["GIẤY CHỨNG NHẬN", "GCN ATTP", "CÓ GCN", "DANH SÁCH CƠ SỞ", "DANH SÁCH CƠ CỞ"]):
+        if any(k in up for k in ["CAM KẾT", "KHÔNG THUỘC ĐỐI TƯỢNG"]):
+            return "II. Đã cam kết"
+        return "I. Có GCN ATTP"
+    if any(k in up for k in ["CAM KẾT", "KHÔNG THUỘC ĐỐI TƯỢNG"]):
+        return "II. Đã cam kết"
     linh_vuc = None
     if "Y TẾ" in up:
         linh_vuc = "Y tế"
@@ -871,8 +1046,27 @@ def _merge_page_continuations(tables: list[TableData]) -> list[TableData]:
             # Fix 3: merge on same normalized headers (any page) OR continuation title + same col count
             same_headers = norm_hdrs(current) == norm_hdrs(nxt)
             continuation_title = _is_continuation_title(nxt.title)
-            same_col_count = abs(len(nxt.headers) - len(current.headers)) <= 2
-            if same_headers or (continuation_title and same_col_count):
+            same_col_count = len(nxt.headers) == len(current.headers)
+            # Check if STT numbers are sequential across the boundary (continuation page)
+            def _last_stt(rows):
+                for r in reversed(rows):
+                    v = str(r[0]).strip() if r else ""
+                    if re.match(r"^\d+$", v):
+                        return int(v)
+                return None
+            def _first_stt(t):
+                candidates = [t.headers] + list(t.rows[:3])
+                for r in candidates:
+                    v = str(r[0]).strip() if r else ""
+                    if re.match(r"^\d+$", v) and int(v) > 0:
+                        return int(v)
+                return None
+            stt_sequential = (
+                _last_stt(current.rows) is not None
+                and _first_stt(nxt) is not None
+                and 1 <= _first_stt(nxt) - _last_stt(current.rows) <= 5
+            )
+            if same_headers or (continuation_title and same_col_count) or (continuation_title and stt_sequential):
                 cur_rows = list(current.rows)
                 cur_summary = list(current.is_summary_row)
                 nxt_rows = list(nxt.rows)
@@ -908,11 +1102,36 @@ def _merge_page_continuations(tables: list[TableData]) -> list[TableData]:
                 else:
                     merged_headers = current.headers if cur_rows else nxt.headers
 
+                # Continuation page's "headers" are misidentified data rows (no real header on
+                # continuation pages). Recover them by prepending to nxt_rows when the continuation
+                # headers don't match HEADER_RE (i.e. they're not real column names).
+                # Skip recovery if the row looks like a page number / sparse garbage
+                # (< 2 non-empty cells and no numeric col-0 STT).
+                if not nxt_hdr_match:
+                    nxt_hdr_as_data = list(nxt.headers)
+                    filled = sum(1 for c in nxt_hdr_as_data if str(c).strip())
+                    col0 = str(nxt_hdr_as_data[0]).strip() if nxt_hdr_as_data else ""
+                    col0_is_stt = bool(re.match(r"^\d+$", col0))
+                    if filled >= 2 or col0_is_stt:
+                        nxt_rows = [nxt_hdr_as_data] + nxt_rows
+                        nxt_summary = [False] + nxt_summary
+
                 # Normalize headers: fix empty slots caused by cross-boundary OCR misassignment
                 all_rows = cur_rows + nxt_rows
                 if all_rows:
                     max_data_cols = max(len(r) for r in all_rows)
                     merged_headers = _normalize_merged_headers(merged_headers, max_data_cols)
+
+                # If merged headers are still garbled (no HEADER_RE match), apply known column names
+                # based on column count for standard Vietnamese ATTP listing tables.
+                if not _HEADER_RE.search(" ".join(merged_headers)):
+                    _KNOWN_HEADERS = {
+                        6: ["STT", "TÊN CƠ SỞ", "ĐỊA CHỈ", "LHKD", "ĐKKD", "LĨNH VỰC"],
+                        5: ["STT", "Họ và tên người kinh doanh", "Địa chỉ kinh doanh", "SĐT", "Loại hình"],
+                    }
+                    ncols = len(merged_headers)
+                    if ncols in _KNOWN_HEADERS:
+                        merged_headers = _KNOWN_HEADERS[ncols]
 
                 current = TableData(
                     title=current.title,

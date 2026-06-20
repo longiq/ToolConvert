@@ -99,17 +99,22 @@ def write_excel(tables: list[TableData], output_path: str) -> str:
     wb = Workbook()
     existing_names: set[str] = set()
 
-    # Sheet 1: "Tổng quan" — all content in order
-    ws_overview = wb.active
-    ws_overview.title = "Tổng quan"
-    existing_names.add("Tổng quan")
+    # Sheet 1: "Tổng quan" — all content in order.
+    # TEMPORARILY DISABLED per request: summary/overview sheet not needed for now.
+    # Source kept (not deleted) so it can be re-enabled later.
+    # ws_overview = wb.active
+    # ws_overview.title = "Tổng quan"
+    # existing_names.add("Tổng quan")
+    #
+    # current_row = 1
+    # for table in tables:
+    #     current_row = _write_table_to_sheet(ws_overview, table, start_row=current_row)
+    #     current_row += 1  # blank row between tables
+    #
+    # _auto_col_widths(ws_overview)
 
-    current_row = 1
-    for table in tables:
-        current_row = _write_table_to_sheet(ws_overview, table, start_row=current_row)
-        current_row += 1  # blank row between tables
-
-    _auto_col_widths(ws_overview)
+    # Remove the default empty sheet created by Workbook() since we skip the overview sheet.
+    _default_sheet = wb.active
 
     # Individual sheets per table
     for table in tables:
@@ -121,6 +126,10 @@ def write_excel(tables: list[TableData], output_path: str) -> str:
         # Fix STT column width
         if table.headers and table.headers[0].strip().upper() in ("STT", "S.TT", "SỐ TT"):
             ws.column_dimensions["A"].width = 6
+
+    # Drop the leftover default sheet if any real table sheets were added.
+    if _default_sheet is not None and len(wb.sheetnames) > 1 and _default_sheet in wb.worksheets:
+        wb.remove(_default_sheet)
 
     wb.save(output_path)
     return output_path

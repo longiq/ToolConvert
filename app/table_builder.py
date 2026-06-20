@@ -90,11 +90,17 @@ def _cluster_y(tops: list[float], tolerance: int = ROW_TOLERANCE,
     return labels
 
 
-def _find_column_boundaries_from_lines(image_np) -> list[int]:
+def _find_column_boundaries_from_lines(image_np, text_x_range: tuple[int, int] = None) -> list[int]:
     """
     Detect vertical table-border lines using OpenCV morphological ops.
     Returns sorted list of x-midpoints between consecutive vertical lines.
     Returns [] if fewer than 2 vertical lines found (caller should fall back to word-gap).
+
+    When text_x_range (min_x, max_x of OCR words) is provided, only vertical lines
+    strictly INSIDE that range are kept as column dividers. This robustly handles
+    page-edge artifacts and table outer borders (which fall at or outside the text
+    extent) without relying on the fragile "strip outermost two lines" heuristic —
+    that heuristic fails when stray marks near the page edge survive line detection.
     """
     try:
         # Convert to grayscale if needed
@@ -156,6 +162,19 @@ def _find_column_boundaries_from_lines(image_np) -> list[int]:
 
         if len(line_xs) < 3:
             return []
+
+        if text_x_range is not None:
+            # Keep only lines comfortably inside the OCR text x-extent: these are the true
+            # inter-column dividers. Lines at/outside the text span are outer borders or
+            # page-edge artifacts and must not become column boundaries. A margin guards
+            # against the left/right table borders that sit only a few px inside the text
+            # (text can overhang the border slightly).
+            min_x, max_x = text_x_range
+            margin = 40
+            inside = [x for x in line_xs if (min_x + margin) < x < (max_x - margin)]
+            if len(inside) >= 2:
+                return inside
+            # Fall through to the legacy heuristic if the extent filter is too aggressive.
 
         # Use inner line positions (between left and right outer borders) as column boundaries.
         # This correctly assigns words to columns: col_idx = number of boundaries to the left
@@ -442,7 +461,11 @@ def build_tables_from_ocr(page_ocr_list: list, page_images: list = None, progres
         if page_images is not None and page_idx < len(page_images):
             try:
                 img_np = np.array(page_images[page_idx])
-                boundaries = _find_column_boundaries_from_lines(img_np)
+                text_min_x = int(df_clean["left"].min())
+                text_max_x = int((df_clean["left"] + df_clean["width"]).max())
+                boundaries = _find_column_boundaries_from_lines(
+                    img_np, text_x_range=(text_min_x, text_max_x)
+                )
             except Exception:
                 boundaries = []
 
@@ -633,16 +656,73 @@ def build_tables_from_ocr(page_ocr_list: list, page_images: list = None, progres
     tables = [_strip_trailing_garbage(t) for t in tables]
     tables = [t for t in tables if t.rows]  # drop tables emptied by garbage stripping
     tables = [_reconstruct_listing(t) for t in tables]
-    for t in tables:
-        sheet = _sheet_name_from_title(t.title)
-        if sheet is None:
-            joined = " ".join(t.headers).upper()
-            if any(k in joined for k in ["HỌ VÀ TÊN NGƯỜI KINH DOANH", "LOẠI HÌNH", "LOAI HINH"]):
-                sheet = "II. Đã cam kết"
-            elif any(k in joined for k in ["TÊN CƠ SỞ", "LHKD", "DKKD", "LĨNH VỰC"]):
-                sheet = "I. Có GCN ATTP"
-        t.sheet_name = sheet
+    _assign_sheet_names(tables)
     return tables
+
+
+# Known ATTP report layouts. Each gov-report variant has a fixed column structure that
+# OCR often mangles (stamps over headers, 2-level headers). We pick the layout by a
+# document-level marker found in any table title/metadata, then by column count.
+_DOC_LAYOUTS = {
+    # Bàn Cờ-style report: "danh sách cơ sở dịch vụ ăn uống" + "không có giấy phép"
+    "banco": {
+        "markers": ["KHÔNG CÓ GIẤY PHÉP", "BÀN CỜ", "TÊN ĐƯỜNG"],
+        "by_cols": {
+            5: ("I. Không có giấy phép KD",
+                ["STT", "Hộ Kinh Doanh", "Số nhà", "Tên đường", "P"]),
+            6: ("II. Dịch vụ ăn uống",
+                ["STT", "Tên cơ sở", "Số nhà", "Đường", "P", "Có giấy"]),
+        },
+    },
+    # Bình Lợi-style report: "giấy chứng nhận an toàn thực phẩm" + "cam kết"
+    "binhloi": {
+        "markers": ["GIẤY CHỨNG NHẬN", "CAM KẾT", "KHÔNG THUỘC ĐỐI TƯỢNG", "LĨNH VỰC"],
+        "by_cols": {
+            6: ("I. Có GCN ATTP",
+                ["STT", "TÊN CƠ SỞ", "ĐỊA CHỈ", "LHKD", "ĐKKD", "LĨNH VỰC"]),
+            5: ("II. Đã cam kết",
+                ["STT", "Họ và tên người kinh doanh", "Địa chỉ kinh doanh", "SĐT", "Loại hình"]),
+        },
+    },
+}
+
+
+def _detect_doc_layout(tables: list[TableData]) -> str | None:
+    """Identify the report variant from markers in any table's title/metadata/headers/data."""
+    parts = []
+    for t in tables:
+        parts.append(t.title or "")
+        parts.extend(t.metadata or [])
+        parts.extend(t.headers)
+        # Sample data cells too: distinctive markers (ward name, category) often survive
+        # only in the data after OCR mangles the title/header region.
+        for r in t.rows[:25]:
+            parts.extend(str(c) for c in r)
+    corpus = " ".join(parts).upper()
+    # Bàn Cờ marker "không có giấy phép" / "dịch vụ ăn uống" is specific enough to win;
+    # check it first since Bình Lợi text never contains it.
+    for key in ("banco", "binhloi"):
+        if any(m in corpus for m in _DOC_LAYOUTS[key]["markers"]):
+            return key
+    return None
+
+
+def _assign_sheet_names(tables: list[TableData]) -> None:
+    layout = _detect_doc_layout(tables)
+    by_cols = _DOC_LAYOUTS[layout]["by_cols"] if layout else {}
+    for t in tables:
+        # Prefer a sheet name derived from this table's own (readable) section title.
+        sheet = _sheet_name_from_title(t.title)
+        spec = by_cols.get(len(t.headers))
+        if spec:
+            sheet_from_cols, known_headers = spec
+            if sheet is None:
+                sheet = sheet_from_cols
+            # Replace garbled OCR headers (no recognizable column label) with the known set.
+            if not _HEADER_RE.search(" ".join(t.headers)) or any(not h.strip() for h in t.headers):
+                if len(known_headers) == len(t.headers):
+                    t.headers = list(known_headers)
+        t.sheet_name = sheet
 
 
 _FOOTER_PHRASE_RE = re.compile(
@@ -769,6 +849,16 @@ def _merge_overflow_rows_multicolumn(table: TableData) -> TableData:
     )
 
 
+# Structural header/title labels that virtually never appear inside a data cell.
+# (Deliberately excludes data-overlapping phrases like "dịch vụ ăn uống" or "hộ kinh
+# doanh", which are legitimate values in LHKD / business-name columns.)
+_HEADER_TITLE_NOISE_RE = re.compile(
+    r"DANH\s*SÁCH|GIẤY\s*PHÉP\s*KINH\s*DOANH|ĐỊA\s*CHỈ|ĐIA\s*CHỈ|SỐ\s*NHÀ"
+    r"|TÊN\s*ĐƯỜNG|TÊN\s*CƠ\s*SỞ|CÓ\s*GIẤY|\bSTT\b|PHƯỜNG\s*BÀN",
+    re.IGNORECASE,
+)
+
+
 def _reconstruct_multicolumn_listing(table: TableData) -> TableData:
     """Rebuild a fragmented multi-column OCR listing into one row per business.
 
@@ -794,6 +884,37 @@ def _reconstruct_multicolumn_listing(table: TableData) -> TableData:
 
     def cell(r, i):
         return r[i].strip() if r and i < len(r) and r[i] else ""
+
+    # Drop leading title / column-header / stamp bands that precede the first numeric STT.
+    # In 2-level-header tables the header row's last column ("P", "Có giấy") would otherwise
+    # be mistaken for a data "main band", spawning a phantom first record and shifting STTs.
+    first_num = next(
+        (i for i, r in enumerate(rows) if re.fullmatch(r"\d{1,3}", cell(r, 0))), None
+    )
+    if first_num is not None and first_num > 0:
+        kept_head = [
+            r for r in rows[:first_num]
+            if not _HEADER_TITLE_NOISE_RE.search(" ".join(cell(r, c) for c in range(ncol)))
+        ]
+        rows = kept_head + rows[first_num:]
+
+    # Split a leading STT number merged into col-0 with following text, e.g.
+    # "45 Quán Bún Mắm Miền" → STT "45" + name "Quán Bún Mắm Miền". This happens on
+    # continuation-page first rows recovered from the misdetected header; without the
+    # split the row is not recognised as a numbered "main band" and its record is lost.
+    split_rows = []
+    for r in rows:
+        c0 = cell(r, 0)
+        m = _STT_MERGED_RE.match(c0)
+        if m and not re.fullmatch(r"\d{1,3}", c0):
+            new_r = list(r) + [""] * (ncol - len(r))
+            new_r[0] = m.group(1)
+            tail = m.group(2).strip()
+            new_r[1] = (tail + " " + new_r[1]).strip() if new_r[1] else tail
+            split_rows.append(new_r)
+        else:
+            split_rows.append(r)
+    rows = split_rows
 
     def is_main(r):
         col0 = cell(r, 0)
@@ -824,9 +945,15 @@ def _reconstruct_multicolumn_listing(table: TableData) -> TableData:
             if val:
                 entry[ci] = (entry[ci] + " " + val).strip()
 
+    first_main = main_idx[0]
     for i, r in enumerate(rows):
         if i in pos_of_main:
             continue  # main band, already an entry
+        # Fragments BEFORE the first record are document title / column-header / stamp
+        # noise (e.g. "DANH SÁCH...", "ĐỊA CHỈ", "SỐ NHÀ", "STT"). Dropping them prevents
+        # the header text from bleeding into the first business entry.
+        if i < first_main and _HEADER_TITLE_NOISE_RE.search(" ".join(cell(r, c) for c in range(ncol))):
+            continue
         prev_main = max((m for m in main_idx if m < i), default=None)
         next_main = min((m for m in main_idx if m > i), default=None)
         if has_name(r) and next_main is not None and (
@@ -1122,16 +1249,10 @@ def _merge_page_continuations(tables: list[TableData]) -> list[TableData]:
                     max_data_cols = max(len(r) for r in all_rows)
                     merged_headers = _normalize_merged_headers(merged_headers, max_data_cols)
 
-                # If merged headers are still garbled (no HEADER_RE match), apply known column names
-                # based on column count for standard Vietnamese ATTP listing tables.
-                if not _HEADER_RE.search(" ".join(merged_headers)):
-                    _KNOWN_HEADERS = {
-                        6: ["STT", "TÊN CƠ SỞ", "ĐỊA CHỈ", "LHKD", "ĐKKD", "LĨNH VỰC"],
-                        5: ["STT", "Họ và tên người kinh doanh", "Địa chỉ kinh doanh", "SĐT", "Loại hình"],
-                    }
-                    ncols = len(merged_headers)
-                    if ncols in _KNOWN_HEADERS:
-                        merged_headers = _KNOWN_HEADERS[ncols]
+                # NOTE: garbled headers are repaired later by _assign_sheet_names(), which
+                # picks the correct known column set for the detected document layout. We no
+                # longer override headers by raw column count here (that mislabeled documents
+                # whose section column counts differ from Bình Lợi's).
 
                 current = TableData(
                     title=current.title,

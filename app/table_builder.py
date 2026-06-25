@@ -12,7 +12,6 @@ import bisect
 import re
 import unicodedata
 import numpy as np
-import cv2
 from .models import TableData
 
 _SUMMARY_RE = re.compile(
@@ -116,6 +115,7 @@ def _find_row_boundaries_from_lines(image_np) -> list[int]:
     Returns [] if fewer than 3 horizontal lines found.
     """
     try:
+        import cv2
         if image_np.ndim == 3:
             gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
         else:

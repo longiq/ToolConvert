@@ -9,6 +9,7 @@ Both engines are adapted to produce the same word/phrase-level DataFrame
 (columns: left, top, width, height, conf, text) consumed by table_builder.
 """
 import os
+import gc
 import pandas as pd
 from pdf2image import convert_from_path
 from .models import TableData
@@ -63,12 +64,43 @@ def _tesseract_page_to_df(image) -> pd.DataFrame:
     )
 
 
+def _detect_page_lines(img, df) -> dict:
+    """Detect column/row border positions from a page image while it is in memory.
+
+    Doing this here (instead of in build_tables_from_ocr) means we never have to
+    keep every page image resident at once — only the small list of integer
+    boundary positions survives, which keeps peak memory well under the 512MB cap.
+    """
+    import numpy as np
+    from .table_builder import (
+        _clean_df,
+        _find_column_boundaries_from_lines,
+        _find_row_boundaries_from_lines,
+    )
+
+    df_clean = _clean_df(df)
+    if df_clean.empty:
+        return {"col": [], "row": []}
+
+    img_np = np.array(img)
+    try:
+        text_min_x = int(df_clean["left"].min())
+        text_max_x = int((df_clean["left"] + df_clean["width"]).max())
+        col = _find_column_boundaries_from_lines(img_np, text_x_range=(text_min_x, text_max_x))
+        row = _find_row_boundaries_from_lines(img_np)
+    finally:
+        del img_np
+    return {"col": col, "row": row}
+
+
+def _pdf_page_count(filepath: str) -> int:
+    from pdf2image import pdfinfo_from_path
+    return int(pdfinfo_from_path(filepath).get("Pages", 0))
+
+
 def extract_from_scanned_pdf(filepath: str, progress_cb=None) -> list[TableData]:
     if progress_cb:
         progress_cb("Đang chuyển PDF thành ảnh...")
-
-    images = convert_from_path(filepath, dpi=OCR_DPI)
-    total = len(images)
 
     engine = OCR_ENGINE
     reader = None
@@ -80,17 +112,49 @@ def extract_from_scanned_pdf(filepath: str, progress_cb=None) -> list[TableData]
         except Exception:
             engine = "tesseract"  # fall back if easyocr unavailable
 
-    ocr_pages = []
-    for i, img in enumerate(images):
+    ocr_pages: list = []
+    page_line_data: list = []
+
+    def _handle_page(img, idx: int, total: int):
         if progress_cb:
-            progress_cb(f"Đang OCR trang {i + 1}/{total} ({engine})...")
+            progress_cb(f"Đang OCR trang {idx + 1}/{total} ({engine})...")
         if engine == "easyocr":
             df = _easyocr_page_to_df(reader, img)
         else:
             df = _tesseract_page_to_df(img)
         ocr_pages.append(df)
+        page_line_data.append(_detect_page_lines(img, df))
+
+    try:
+        total = _pdf_page_count(filepath)
+    except Exception:
+        total = 0
+
+    if total > 0:
+        # Render and process one page at a time so only a single page image is
+        # ever held in memory (the previous version materialised every page).
+        for p in range(1, total + 1):
+            imgs = convert_from_path(filepath, dpi=OCR_DPI, first_page=p, last_page=p)
+            img = imgs[0]
+            try:
+                _handle_page(img, p - 1, total)
+            finally:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+                del imgs, img
+                gc.collect()
+    else:
+        # Fallback if the page count couldn't be determined.
+        images = convert_from_path(filepath, dpi=OCR_DPI)
+        total = len(images)
+        for i, img in enumerate(images):
+            _handle_page(img, i, total)
+        del images
+        gc.collect()
 
     if progress_cb:
         progress_cb("Đang phân tích cấu trúc bảng...")
 
-    return build_tables_from_ocr(ocr_pages, page_images=images, progress_cb=progress_cb)
+    return build_tables_from_ocr(ocr_pages, page_line_data=page_line_data, progress_cb=progress_cb)

@@ -95,14 +95,55 @@ def _find_column_boundaries_from_lines(image_np, text_x_range: tuple[int, int] =
     Returns sorted list of x-midpoints between consecutive vertical lines.
     Returns [] if fewer than 2 vertical lines found (caller should fall back to word-gap).
 
-    When text_x_range (min_x, max_x of OCR words) is provided, only vertical lines
-    strictly INSIDE that range are kept as column dividers. This robustly handles
-    page-edge artifacts and table outer borders (which fall at or outside the text
-    extent) without relying on the fragile "strip outermost two lines" heuristic —
-    that heuristic fails when stray marks near the page edge survive line detection.
-        # Use inner line positions (between left and right outer borders) as column boundaries.
-        # This correctly assigns words to columns: col_idx = number of boundaries to the left
-        # of word_left. The leftmost line is the table's left outer border; rightmost is right border.
+    When text_x_range is provided, only lines strictly inside that x-range are kept,
+    filtering out page-edge artifacts and outer table borders.
+    """
+    try:
+        import cv2
+        if image_np.ndim == 3:
+            gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = image_np.copy()
+
+        h, w = gray.shape
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        kernel_h = max(h // 6, 40)
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h))
+        vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel)
+
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        vertical_lines = cv2.dilate(vertical_lines, dilate_kernel, iterations=1)
+
+        contours, _ = cv2.findContours(vertical_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        x_positions = []
+        min_y_span = h * 0.25
+
+        for cnt in contours:
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            if cw < 20 and ch >= min_y_span:
+                x_center = x + cw // 2
+                if text_x_range is None or (text_x_range[0] < x_center < text_x_range[1]):
+                    x_positions.append(x_center)
+
+        if len(x_positions) < 2:
+            return []
+
+        x_positions.sort()
+        clusters: list[list[int]] = []
+        for x in x_positions:
+            if clusters and abs(x - clusters[-1][-1]) <= 15:
+                clusters[-1].append(x)
+            else:
+                clusters.append([x])
+
+        line_xs = sorted(int(np.median(c)) for c in clusters)
+
+        if len(line_xs) < 2:
+            return []
+
+        # Inner boundaries only (strip outer left/right borders)
         return line_xs[1:-1]
 
     except Exception:
@@ -783,6 +824,15 @@ _HEADER_TITLE_NOISE_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+def _reconstruct_multicolumn_listing(table: TableData) -> TableData:
+    """Reconstruct multi-column business listing using STT-anchored block grouping."""
+    rows = table.rows
+    ncol = max(len(table.headers), max((len(r) for r in rows), default=0))
+    last = ncol - 1
+
+    def cell(r, c) -> str:
+        return str(r[c]).strip() if c < len(r) else ""
 
     def is_main(r):
         col0 = cell(r, 0)

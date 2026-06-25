@@ -409,7 +409,7 @@ def _merge_continuation_rows(bands: list[dict], page_height: int) -> list[dict]:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def build_tables_from_ocr(page_ocr_list: list, page_images: list = None, progress_cb=None) -> list[TableData]:
+def build_tables_from_ocr(page_ocr_list: list, page_line_data: list = None, progress_cb=None) -> list[TableData]:
     tables: list[TableData] = []
 
     for page_idx, df in enumerate(page_ocr_list):
@@ -422,18 +422,10 @@ def build_tables_from_ocr(page_ocr_list: list, page_images: list = None, progres
 
         page_height = int(df_clean["top"].max() + df_clean["height"].max()) if not df_clean.empty else 3000
 
-        # Try OpenCV line detection first if images are provided
-        boundaries = []
-        if page_images is not None and page_idx < len(page_images):
-            try:
-                img_np = np.array(page_images[page_idx])
-                text_min_x = int(df_clean["left"].min())
-                text_max_x = int((df_clean["left"] + df_clean["width"]).max())
-                boundaries = _find_column_boundaries_from_lines(
-                    img_np, text_x_range=(text_min_x, text_max_x)
-                )
-            except Exception:
-                boundaries = []
+        # Use OpenCV line boundaries detected per-page (computed in parser_ocr
+        # while the page image was in memory) instead of holding every image here.
+        line_data = page_line_data[page_idx] if (page_line_data and page_idx < len(page_line_data)) else None
+        boundaries = list(line_data.get("col", [])) if line_data else []
 
         if len(boundaries) < 2:
             boundaries = _find_column_boundaries(df)
@@ -452,13 +444,8 @@ def build_tables_from_ocr(page_ocr_list: list, page_images: list = None, progres
                 ))
             continue
 
-        # Detect horizontal row boundaries — prevents cross-row OCR text bleeding
-        row_boundaries: list[int] = []
-        if page_images is not None and page_idx < len(page_images):
-            try:
-                row_boundaries = _find_row_boundaries_from_lines(img_np)
-            except Exception:
-                row_boundaries = []
+        # Horizontal row boundaries (also detected per-page) — prevents cross-row OCR bleeding
+        row_boundaries: list[int] = list(line_data.get("row", [])) if line_data else []
 
         bands = _build_cell_grid(df, boundaries, row_boundaries=row_boundaries or None)
         bands = _merge_continuation_rows(bands, page_height)

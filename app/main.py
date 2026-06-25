@@ -12,7 +12,6 @@ from fastapi.staticfiles import StaticFiles
 from .models import Job, JobStatus
 from .detector import detect_pdf_type
 from .parser_text import extract_from_text_pdf
-from .parser_ocr import extract_from_scanned_pdf
 from .excel_writer import write_excel
 
 UPLOAD_DIR = Path("uploads")
@@ -50,6 +49,9 @@ def _process_pdf(job_id: str):
         if pdf_type == "text":
             tables = extract_from_text_pdf(job.pdf_path, progress_cb=progress)
         else:
+            # Import the OCR stack (pdf2image/opencv/pandas) lazily so text-only
+            # PDFs never pay its memory cost.
+            from .parser_ocr import extract_from_scanned_pdf
             tables = extract_from_scanned_pdf(job.pdf_path, progress_cb=progress)
 
         if not tables:
@@ -76,9 +78,12 @@ async def lifespan(app: FastAPI):
     import threading
     def _warm_ocr():
         try:
-            from .parser_ocr import _get_easyocr_reader, OCR_ENGINE
-            if OCR_ENGINE == "easyocr":
-                _get_easyocr_reader()
+            # Only import the OCR stack when EasyOCR is actually in use; with
+            # tesseract this avoids loading pandas/opencv/pdf2image at startup.
+            if os.environ.get("OCR_ENGINE", "easyocr").lower() != "easyocr":
+                return
+            from .parser_ocr import _get_easyocr_reader
+            _get_easyocr_reader()
         except Exception:
             pass
     threading.Thread(target=_warm_ocr, daemon=True).start()

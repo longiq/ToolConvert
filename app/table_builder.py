@@ -12,6 +12,7 @@ import bisect
 import re
 import unicodedata
 import numpy as np
+import pandas as pd
 from .models import TableData
 
 _SUMMARY_RE = re.compile(
@@ -48,9 +49,16 @@ def _is_summary(text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _clean_df(df):
-    df = df[df["conf"] > 20].copy()
-    df = df[df["text"].str.strip().astype(bool)].copy()
-    return df
+    # Normalize column dtypes first: on a blank/near-blank page tesseract returns
+    # a "text" column that is all-NaN, which pandas infers as float64 — the .str
+    # accessor below then raises "Can only use .str accessor with string values".
+    # Coerce text→str and conf→numeric so the filters always work.
+    df = df.copy()
+    df["text"] = df["text"].fillna("").astype(str)
+    df["conf"] = pd.to_numeric(df["conf"], errors="coerce").fillna(-1)
+    df = df[df["conf"] > 20]
+    df = df[df["text"].str.strip().astype(bool)]
+    return df.copy()
 
 
 def _cluster_y(tops: list[float], tolerance: int = ROW_TOLERANCE,

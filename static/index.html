@@ -118,12 +118,26 @@
     }
   }
 
+  // Tolerate transient failures (server cold start, restart that drops the
+  // in-memory job, gateway hiccups) before giving up. A single non-OK response
+  // should not kill an otherwise healthy job.
+  const MAX_POLL_FAILURES = 8;
+
   function pollStatus(jobId) {
     clearInterval(pollTimer);
+    let failures = 0;
     pollTimer = setInterval(async () => {
       try {
         const res = await fetch(`/status/${jobId}`);
-        if (!res.ok) { clearInterval(pollTimer); showError('Không thể kiểm tra trạng thái.'); return; }
+        if (!res.ok) {
+          failures++;
+          if (failures >= MAX_POLL_FAILURES) {
+            clearInterval(pollTimer);
+            showError('Không thể kiểm tra trạng thái.');
+          }
+          return;
+        }
+        failures = 0;
         const data = await res.json();
         progressMsg.textContent = data.progress || 'Đang xử lý...';
 
@@ -140,7 +154,12 @@
           showError(data.error || 'Đã xảy ra lỗi khi xử lý.');
         }
       } catch (e) {
-        // network glitch, keep polling
+        // network glitch — count it but keep polling
+        failures++;
+        if (failures >= MAX_POLL_FAILURES) {
+          clearInterval(pollTimer);
+          showError('Không thể kiểm tra trạng thái.');
+        }
       }
     }, 1500);
   }

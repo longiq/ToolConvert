@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: toolconvert
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: OCR_ENGINE
+        value: tesseract
+    healthCheckPath: /health
+    autoDeploy: true

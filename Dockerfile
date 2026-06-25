@@ -1,4 +1,4 @@
-FROM --platform=linux/arm64 python:3.12-slim
+FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
@@ -11,18 +11,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install CPU-only torch first to avoid pulling huge CUDA wheels (EasyOCR dep)
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
-
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 RUN mkdir -p uploads
 
-EXPOSE 8000
+ENV OCR_ENGINE=tesseract
+ENV PORT=8000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s \
-    CMD curl -f http://localhost:8000/health || exit 1
+EXPOSE $PORT
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s \
+    CMD curl -f http://localhost:${PORT}/health || exit 1
+
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]

@@ -129,10 +129,29 @@ async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
     return {"job_id": job_id}
 
 
+def _is_valid_job_id(job_id: str) -> bool:
+    try:
+        uuid.UUID(job_id)
+        return True
+    except ValueError:
+        return False
+
+
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
     job = _jobs.get(job_id)
     if not job:
+        # In-memory state can be lost on a worker restart / cold start. If the
+        # output file still exists on disk, the job actually finished — report
+        # it as done instead of a 404 that the frontend can't recover from.
+        if _is_valid_job_id(job_id):
+            xlsx_path = UPLOAD_DIR / f"{job_id}.xlsx"
+            if xlsx_path.exists():
+                return {
+                    "status": JobStatus.DONE,
+                    "progress": "Hoàn tất!",
+                    "download_url": f"/download/{job_id}",
+                }
         raise HTTPException(404, "Không tìm thấy job.")
 
     response: dict = {
@@ -149,14 +168,21 @@ def get_status(job_id: str):
 @app.get("/download/{job_id}")
 def download_excel(job_id: str):
     job = _jobs.get(job_id)
-    if not job or job.status != JobStatus.DONE:
+    if job and job.status == JobStatus.DONE:
+        xlsx_path = job.xlsx_path
+    elif job:
         raise HTTPException(404, "File chưa sẵn sàng hoặc không tồn tại.")
-    if not os.path.exists(job.xlsx_path):
+    else:
+        # Fall back to disk if the in-memory job was lost after a restart.
+        xlsx_path = str(UPLOAD_DIR / f"{job_id}.xlsx")
+        if not (_is_valid_job_id(job_id) and os.path.exists(xlsx_path)):
+            raise HTTPException(404, "File chưa sẵn sàng hoặc không tồn tại.")
+    if not os.path.exists(xlsx_path):
         raise HTTPException(404, "File đã bị xóa.")
 
     filename = f"output_{job_id[:8]}.xlsx"
     return FileResponse(
-        path=job.xlsx_path,
+        path=xlsx_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=filename,
     )

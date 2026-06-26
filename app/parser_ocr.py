@@ -64,6 +64,106 @@ def _tesseract_page_to_df(image) -> pd.DataFrame:
     )
 
 
+def _google_docai_page_to_df(page, document_text: str) -> pd.DataFrame:
+    """Convert one Document AI page into the same 6-column DataFrame that
+    tesseract/easyocr produce, so table_builder needs no changes.
+
+    Document AI gives normalised vertices (0.0-1.0); we scale them back to
+    pixel coordinates using the page dimension Google reports.
+    """
+    w = int(getattr(page.dimension, "width", 0)) or 2480
+    h = int(getattr(page.dimension, "height", 0)) or 3508
+    rows = []
+    for token in page.tokens:
+        bbox = token.layout.bounding_poly.normalized_vertices
+        if not bbox:
+            continue
+        xs = [v.x for v in bbox]
+        ys = [v.y for v in bbox]
+        left = int(min(xs) * w)
+        top = int(min(ys) * h)
+        width = int((max(xs) - min(xs)) * w)
+        height = int((max(ys) - min(ys)) * h)
+        conf = float(token.layout.confidence) * 100
+
+        # Document AI stores text as offsets into document.text, not inline.
+        text = ""
+        for seg in token.layout.text_anchor.text_segments:
+            start = int(seg.start_index) if seg.start_index else 0
+            end = int(seg.end_index)
+            text += document_text[start:end]
+        text = text.strip()
+        if not text:
+            continue
+        rows.append({
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+            "conf": conf,
+            "text": text,
+        })
+    if not rows:
+        return pd.DataFrame(columns=["left", "top", "width", "height", "conf", "text"])
+    return pd.DataFrame(rows)
+
+
+def _google_docai_extract(filepath: str, progress_cb=None) -> list[TableData]:
+    """OCR a scanned PDF via Google Document AI instead of running tesseract
+    locally. Google does the heavy lifting; Render only relays the file, so
+    peak RAM stays tiny and there is no OOM risk.
+    """
+    import json
+    from google.cloud import documentai
+    from google.oauth2 import service_account
+
+    creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    credentials = None
+    if creds_json:
+        credentials = service_account.Credentials.from_service_account_info(
+            json.loads(creds_json),
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+
+    location = os.environ.get("GOOGLE_LOCATION", "us")
+    client = documentai.DocumentProcessorServiceClient(
+        credentials=credentials,
+        client_options={"api_endpoint": f"{location}-documentai.googleapis.com"},
+    )
+    processor_name = client.processor_path(
+        os.environ["GOOGLE_PROJECT_ID"],
+        location,
+        os.environ["GOOGLE_PROCESSOR_ID"],
+    )
+
+    if progress_cb:
+        progress_cb("Đang gửi PDF lên Google Document AI...")
+
+    with open(filepath, "rb") as f:
+        pdf_bytes = f.read()
+
+    request = documentai.ProcessRequest(
+        name=processor_name,
+        raw_document=documentai.RawDocument(
+            content=pdf_bytes, mime_type="application/pdf"
+        ),
+    )
+    result = client.process_document(request=request)
+    document = result.document
+
+    if progress_cb:
+        progress_cb("Đang phân tích cấu trúc bảng...")
+
+    ocr_pages = [_google_docai_page_to_df(page, document.text) for page in document.pages]
+    # Document AI doesn't expose the rendered image, so we let table_builder
+    # infer columns/rows purely from token positions (no ruled-line detection).
+    page_line_data = [{"col": [], "row": []} for _ in ocr_pages]
+
+    return build_tables_from_ocr(
+        ocr_pages, page_line_data=page_line_data, progress_cb=progress_cb
+    )
+
+
 def _detect_page_lines(img, df) -> dict:
     """Detect column/row border positions from a page image while it is in memory.
 
@@ -99,6 +199,11 @@ def _pdf_page_count(filepath: str) -> int:
 
 
 def extract_from_scanned_pdf(filepath: str, progress_cb=None) -> list[TableData]:
+    # Cloud OCR path: hand the whole PDF to Google Document AI. No pdf2image,
+    # no local tesseract — keeps Render's RAM usage minimal.
+    if OCR_ENGINE == "docai":
+        return _google_docai_extract(filepath, progress_cb=progress_cb)
+
     if progress_cb:
         progress_cb("Đang chuyển PDF thành ảnh...")
 

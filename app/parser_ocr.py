@@ -142,10 +142,16 @@ def _google_docai_extract(filepath: str, progress_cb=None) -> list[TableData]:
     with open(filepath, "rb") as f:
         pdf_bytes = f.read()
 
+    # field_mask excludes pages.image from the response → "imageless mode".
+    # This raises the per-request page limit from 15 to 30 and cuts response size.
+    from google.protobuf import field_mask_pb2
     request = documentai.ProcessRequest(
         name=processor_name,
         raw_document=documentai.RawDocument(
             content=pdf_bytes, mime_type="application/pdf"
+        ),
+        field_mask=field_mask_pb2.FieldMask(
+            paths=["text", "pages.layout", "pages.tokens", "pages.dimension"]
         ),
     )
     result = client.process_document(request=request)

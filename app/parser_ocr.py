@@ -18,6 +18,9 @@ from .table_builder import build_tables_from_ocr
 # Engine selection: "easyocr" (default) or "tesseract"
 OCR_ENGINE = os.environ.get("OCR_ENGINE", "easyocr").lower()
 OCR_DPI = int(os.environ.get("OCR_DPI", "220"))
+# Pages per Document AI request. Sync API allows 30 in imageless mode; we send
+# chunks of this size so PDFs of any length are handled.
+DOCAI_PAGES_PER_REQUEST = int(os.environ.get("DOCAI_PAGES_PER_REQUEST", "15"))
 
 _easyocr_reader = None
 
@@ -108,6 +111,30 @@ def _google_docai_page_to_df(page, document_text: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _split_pdf_into_chunks(pdf_bytes: bytes, pages_per_chunk: int) -> list[bytes]:
+    """Split a PDF byte string into a list of smaller PDF byte strings, each
+    with at most `pages_per_chunk` pages. If the PDF already fits in one chunk,
+    the original bytes are returned unchanged.
+    """
+    import io
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    total = len(reader.pages)
+    if total <= pages_per_chunk:
+        return [pdf_bytes]
+
+    chunks = []
+    for start in range(0, total, pages_per_chunk):
+        writer = PdfWriter()
+        for i in range(start, min(start + pages_per_chunk, total)):
+            writer.add_page(reader.pages[i])
+        buf = io.BytesIO()
+        writer.write(buf)
+        chunks.append(buf.getvalue())
+    return chunks
+
+
 def _google_docai_extract(filepath: str, progress_cb=None) -> list[TableData]:
     """OCR a scanned PDF via Google Document AI instead of running tesseract
     locally. Google does the heavy lifting; Render only relays the file, so
@@ -136,31 +163,47 @@ def _google_docai_extract(filepath: str, progress_cb=None) -> list[TableData]:
         os.environ["GOOGLE_PROCESSOR_ID"],
     )
 
-    if progress_cb:
-        progress_cb("Đang gửi PDF lên Google Document AI...")
-
     with open(filepath, "rb") as f:
         pdf_bytes = f.read()
 
     # field_mask excludes pages.image from the response → "imageless mode".
     # This raises the per-request page limit from 15 to 30 and cuts response size.
     from google.protobuf import field_mask_pb2
-    request = documentai.ProcessRequest(
-        name=processor_name,
-        raw_document=documentai.RawDocument(
-            content=pdf_bytes, mime_type="application/pdf"
-        ),
-        field_mask=field_mask_pb2.FieldMask(
-            paths=["text", "pages.layout", "pages.tokens", "pages.dimension"]
-        ),
+    field_mask = field_mask_pb2.FieldMask(
+        paths=["text", "pages.layout", "pages.tokens", "pages.dimension"]
     )
-    result = client.process_document(request=request)
-    document = result.document
+
+    # Document AI's synchronous API caps a single request at 30 pages (imageless
+    # mode). Split larger PDFs into chunks and OCR each chunk separately, then
+    # concatenate — this handles documents of any length on the free sync API
+    # without needing batch processing / Cloud Storage.
+    chunks = _split_pdf_into_chunks(pdf_bytes, DOCAI_PAGES_PER_REQUEST)
+    total_chunks = len(chunks)
+
+    ocr_pages: list = []
+    for ci, chunk in enumerate(chunks):
+        if progress_cb:
+            if total_chunks > 1:
+                progress_cb(
+                    f"Đang gửi phần {ci + 1}/{total_chunks} lên Google Document AI..."
+                )
+            else:
+                progress_cb("Đang gửi PDF lên Google Document AI...")
+
+        request = documentai.ProcessRequest(
+            name=processor_name,
+            raw_document=documentai.RawDocument(
+                content=chunk, mime_type="application/pdf"
+            ),
+            field_mask=field_mask,
+        )
+        document = client.process_document(request=request).document
+        for page in document.pages:
+            ocr_pages.append(_google_docai_page_to_df(page, document.text))
 
     if progress_cb:
         progress_cb("Đang phân tích cấu trúc bảng...")
 
-    ocr_pages = [_google_docai_page_to_df(page, document.text) for page in document.pages]
     # Document AI doesn't expose the rendered image, so we let table_builder
     # infer columns/rows purely from token positions (no ruled-line detection).
     page_line_data = [{"col": [], "row": []} for _ in ocr_pages]

@@ -9,3 +9,4 @@ pdf2image>=1.17
 Pillow>=10.0
 numpy>=1.26
 pandas>=2.0
+google-cloud-documentai>=2.20

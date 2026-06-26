@@ -95,7 +95,34 @@ def _write_table_to_sheet(ws, table: TableData, start_row: int = 1, freeze: bool
     return row
 
 
+def _merge_continuation_tables(tables: list[TableData]) -> list[TableData]:
+    """Merge consecutive tables that share the same column headers.
+
+    Multi-page PDFs often repeat the table header row at the top of every
+    page, so table_builder sees each page-segment as its own table. This
+    function folds those segments back into a single TableData so they land
+    in one Excel sheet instead of one per page.
+    """
+    if not tables:
+        return tables
+
+    def _norm(headers: list[str]) -> tuple:
+        return tuple(h.strip().lower() for h in headers)
+
+    merged: list[TableData] = [tables[0]]
+    for current in tables[1:]:
+        prev = merged[-1]
+        if prev.headers and _norm(prev.headers) == _norm(current.headers):
+            # Same header → continuation: append rows only, discard repeated header.
+            prev.rows.extend(current.rows)
+            prev.is_summary_row.extend(current.is_summary_row)
+        else:
+            merged.append(current)
+    return merged
+
+
 def write_excel(tables: list[TableData], output_path: str) -> str:
+    tables = _merge_continuation_tables(tables)
     wb = Workbook()
     existing_names: set[str] = set()
 

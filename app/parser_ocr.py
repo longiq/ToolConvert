@@ -24,7 +24,7 @@ DOCAI_PAGES_PER_REQUEST = int(os.environ.get("DOCAI_PAGES_PER_REQUEST", "15"))
 # VLM engine (Qwen2.5-VL via OpenRouter): a vision model reads each page image
 # and returns already-structured rows, so we skip table_builder's geometric
 # column reconstruction entirely.
-VLM_MODEL = os.environ.get("VLM_MODEL", "qwen/qwen2.5-vl-72b-instruct:free")
+VLM_MODEL = os.environ.get("VLM_MODEL", "meta-llama/llama-4-maverick:free")
 VLM_DPI = int(os.environ.get("VLM_DPI", "150"))  # lower than OCR_DPI: lighter image, faster
 
 _easyocr_reader = None
@@ -308,6 +308,11 @@ def _vlm_call_openrouter(data_url: str) -> dict:
                 headers=headers,
                 timeout=120,
             )
+            if resp.status_code == 404:
+                raise RuntimeError(
+                    f"Model '{VLM_MODEL}' không tìm thấy trên OpenRouter. "
+                    f"Đặt env var VLM_MODEL thành model hợp lệ (xem openrouter.ai/models)."
+                )
             if resp.status_code in (429, 500, 502, 503, 504):
                 last_err = RuntimeError(f"OpenRouter HTTP {resp.status_code}")
                 time.sleep(backoff)

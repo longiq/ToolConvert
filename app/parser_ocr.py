@@ -15,12 +15,17 @@ from pdf2image import convert_from_path
 from .models import TableData
 from .table_builder import build_tables_from_ocr
 
-# Engine selection: "easyocr" (default) or "tesseract"
+# Engine selection: "easyocr" (default), "tesseract", "docai", or "vlm"
 OCR_ENGINE = os.environ.get("OCR_ENGINE", "easyocr").lower()
 OCR_DPI = int(os.environ.get("OCR_DPI", "220"))
 # Pages per Document AI request. Sync API allows 30 in imageless mode; we send
 # chunks of this size so PDFs of any length are handled.
 DOCAI_PAGES_PER_REQUEST = int(os.environ.get("DOCAI_PAGES_PER_REQUEST", "15"))
+# VLM engine (Qwen2.5-VL via OpenRouter): a vision model reads each page image
+# and returns already-structured rows, so we skip table_builder's geometric
+# column reconstruction entirely.
+VLM_MODEL = os.environ.get("VLM_MODEL", "qwen/qwen2.5-vl-72b-instruct:free")
+VLM_DPI = int(os.environ.get("VLM_DPI", "150"))  # lower than OCR_DPI: lighter image, faster
 
 _easyocr_reader = None
 
@@ -213,6 +218,207 @@ def _google_docai_extract(filepath: str, progress_cb=None) -> list[TableData]:
     )
 
 
+# ---------------------------------------------------------------------------
+# Vision-LLM engine (Qwen2.5-VL via OpenRouter)
+# ---------------------------------------------------------------------------
+
+_VLM_PROMPT = (
+    "Bạn là công cụ trích xuất bảng từ ảnh tài liệu tiếng Việt. "
+    "Ảnh này là một trang chứa (một phần của) bảng danh sách. "
+    "Hãy đọc và trả về DUY NHẤT một JSON object, không kèm lời giải thích, "
+    "theo đúng dạng:\n"
+    '{"title": "<tiêu đề bảng nếu có, else "">", '
+    '"headers": ["<tên cột 1>", ...], '
+    '"rows": [["<ô 1>", "<ô 2>", ...], ...]}\n\n'
+    "QUY TẮC BẮT BUỘC:\n"
+    "- Chép NGUYÊN VĂN từng dòng, đúng thứ tự trên xuống. KHÔNG tóm tắt, "
+    "KHÔNG bỏ sót, KHÔNG gộp nhiều dòng làm một.\n"
+    "- Mỗi dòng dữ liệu là một phần tử trong 'rows', số ô đúng bằng số cột.\n"
+    "- Ô trống để chuỗi rỗng \"\". TUYỆT ĐỐI không bịa nội dung không có trong ảnh.\n"
+    "- Giữ nguyên số thứ tự (STT) như in trên ảnh.\n"
+    "- Nếu trang không có dòng dữ liệu nào, trả 'rows': []."
+)
+
+
+def _pil_to_data_url(image) -> str:
+    """Encode a PIL image as a base64 JPEG data URL for the vision API."""
+    import io
+    import base64
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="JPEG", quality=85)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def _parse_vlm_json(content: str) -> dict:
+    """Pull the JSON object out of a model reply, tolerating ```json fences
+    and leading/trailing prose."""
+    import json
+    text = content.strip()
+    if text.startswith("```"):
+        # strip a ```json ... ``` fence
+        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
+        if text.lstrip().lower().startswith("json"):
+            text = text.lstrip()[4:]
+    text = text.strip()
+    # Fall back to the outermost {...} if there is surrounding noise.
+    if not text.startswith("{"):
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start:end + 1]
+    return json.loads(text)
+
+
+def _vlm_call_openrouter(data_url: str) -> dict:
+    """POST one page image to OpenRouter and return the parsed JSON table.
+    Retries on rate-limit / server errors with exponential backoff."""
+    import time
+    import requests
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("Thiếu OPENROUTER_API_KEY để dùng engine VLM.")
+
+    payload = {
+        "model": VLM_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _VLM_PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+        "temperature": 0,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    backoff = 2
+    last_err = None
+    for attempt in range(4):
+        try:
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=120,
+            )
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last_err = RuntimeError(f"OpenRouter HTTP {resp.status_code}")
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            return _parse_vlm_json(content)
+        except requests.RequestException as e:
+            last_err = e
+            time.sleep(backoff)
+            backoff *= 2
+    raise RuntimeError(f"Gọi OpenRouter thất bại sau nhiều lần thử: {last_err}")
+
+
+def _vlm_page_to_table(image, page_idx: int):
+    """Run one page image through the VLM and build a TableData, or None if the
+    page yielded no rows."""
+    data_url = _pil_to_data_url(image)
+    parsed = _vlm_call_openrouter(data_url)
+
+    headers = [str(h) for h in (parsed.get("headers") or [])]
+    raw_rows = parsed.get("rows") or []
+    rows = [[str(c) for c in row] for row in raw_rows if isinstance(row, list)]
+    if not rows:
+        return None
+
+    return TableData(
+        title=str(parsed.get("title") or "").strip(),
+        metadata=[],
+        headers=headers,
+        rows=rows,
+        page=page_idx + 1,
+        is_summary_row=[False] * len(rows),
+    )
+
+
+def _vlm_check_stt_continuity(tables: list) -> list[str]:
+    """Guardrail against hallucination/omission: verify the first column reads
+    as a monotonically increasing STT sequence across all rows. Returns a list
+    of human-readable warnings (empty if the sequence looks clean)."""
+    import re
+    warnings: list[str] = []
+    prev: int | None = None
+    for t in tables:
+        for row in t.rows:
+            col0 = str(row[0]).strip() if row else ""
+            if not re.fullmatch(r"\d{1,4}", col0):
+                continue
+            n = int(col0)
+            if prev is not None:
+                if n == prev:
+                    warnings.append(f"STT {n} bị lặp")
+                elif n != prev + 1:
+                    warnings.append(f"STT nhảy từ {prev} sang {n}")
+            prev = n
+    return warnings
+
+
+def _openrouter_vlm_extract(filepath: str, progress_cb=None) -> list[TableData]:
+    """Extract tables by sending each rendered page image to a vision LLM
+    (Qwen2.5-VL by default) via OpenRouter. Pages are rendered one at a time to
+    keep memory low, exactly like the tesseract path."""
+    from .table_builder import _assign_sheet_names
+
+    try:
+        total = _pdf_page_count(filepath)
+    except Exception:
+        total = 0
+
+    tables: list[TableData] = []
+
+    def _handle(image, idx: int, n: int):
+        if progress_cb:
+            progress_cb(f"Đang đọc trang {idx + 1}/{n} bằng AI (Qwen2.5-VL)...")
+        table = _vlm_page_to_table(image, idx)
+        if table is not None:
+            tables.append(table)
+
+    if total > 0:
+        for p in range(1, total + 1):
+            imgs = convert_from_path(filepath, dpi=VLM_DPI, first_page=p, last_page=p)
+            img = imgs[0]
+            try:
+                _handle(img, p - 1, total)
+            finally:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+                del imgs, img
+                gc.collect()
+    else:
+        images = convert_from_path(filepath, dpi=VLM_DPI)
+        total = len(images)
+        for i, img in enumerate(images):
+            _handle(img, i, total)
+        del images
+        gc.collect()
+
+    # Flag (don't block) suspicious STT sequences so the user can spot possible
+    # hallucination / dropped rows in an otherwise plausible-looking result.
+    warnings = _vlm_check_stt_continuity(tables)
+    if warnings and progress_cb:
+        preview = "; ".join(warnings[:3])
+        progress_cb(f"Hoàn tất (lưu ý kiểm tra: {preview})")
+
+    _assign_sheet_names(tables)
+    return tables
+
+
 def _detect_page_lines(img, df) -> dict:
     """Detect column/row border positions from a page image while it is in memory.
 
@@ -252,6 +458,11 @@ def extract_from_scanned_pdf(filepath: str, progress_cb=None) -> list[TableData]
     # no local tesseract — keeps Render's RAM usage minimal.
     if OCR_ENGINE == "docai":
         return _google_docai_extract(filepath, progress_cb=progress_cb)
+
+    # Vision-LLM path: a multimodal model reads each page image and returns
+    # structured rows directly (bypasses geometric table reconstruction).
+    if OCR_ENGINE == "vlm":
+        return _openrouter_vlm_extract(filepath, progress_cb=progress_cb)
 
     if progress_cb:
         progress_cb("Đang chuyển PDF thành ảnh...")

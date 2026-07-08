@@ -11,3 +11,4 @@ numpy>=1.26
 pandas>=2.0
 google-cloud-documentai>=2.20
 pypdf>=4.0
+requests>=2.31
